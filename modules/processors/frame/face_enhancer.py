@@ -14,7 +14,6 @@ from modules.face_analyser import get_one_face, get_many_faces, get_one_face_lef
 from modules.processors.frame.face_swapper import crop_face_region,create_adjusted_face,create_edge_blur_mask,blend_with_mask,reset_face_tracking
 
 FACE_ENHANCER = None
-THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
 NAME = 'DLC.FACE-ENHANCER'
 
@@ -47,11 +46,15 @@ def get_face_enhancer() -> Any:
 
 
 def enhance_face(temp_frame: Frame) -> Frame:
-    with THREAD_SEMAPHORE:
-        _, _, temp_frame = get_face_enhancer().enhance(
-            temp_frame,
-            paste_back=True
-        )
+    # Remove THREAD_SEMAPHORE to allow parallel GPU processing
+    # Set paste_back=False to skip redundant face detection inside GFPGAN
+    _, restored_faces, _ = get_face_enhancer().enhance(
+        temp_frame,
+        paste_back=False
+    )
+    # Return the first (and only) restored face from the cropped input
+    if restored_faces is not None and len(restored_faces) > 0:
+        return restored_faces[0]
     return temp_frame
 
 
