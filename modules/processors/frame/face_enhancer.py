@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import Any, List, Optional
 import cv2
 import threading
 import gfpgan
@@ -7,13 +7,12 @@ import os
 import modules.globals
 import modules.processors.frame.core
 from modules.core import update_status
-from modules.face_analyser import get_one_face
 from modules.typing import Frame, Face
 from modules.utilities import conditional_download, resolve_relative_path, is_image, is_video
 from modules.face_analyser import get_one_face, get_many_faces, get_one_face_left, get_one_face_right, get_face_analyser
-from modules.processors.frame.face_swapper import crop_face_region,create_adjusted_face,create_edge_blur_mask,blend_with_mask,reset_face_tracking
+from modules.processors.frame.face_swapper import crop_face_region,create_adjusted_face,reset_face_tracking
 
-FACE_ENHANCER = None
+FACE_ENHANCER: Any = None
 THREAD_LOCK = threading.Lock()
 NAME = 'DLC.FACE-ENHANCER'
 
@@ -58,7 +57,7 @@ def enhance_face(temp_frame: Frame) -> Frame:
     return temp_frame
 
 
-def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
+def process_frame(source_face: Optional[Face], temp_frame: Frame) -> Frame:
 
     face_analyser = get_face_analyser()
     try:
@@ -101,17 +100,16 @@ def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
         cropped_frame, crop_info = crop_face_region(temp_frame, target_face,0.2)
         # Create an adjusted face for the cropped region
 
-        cropped_frame = enhance_face(cropped_frame)
-        # Create a mask for blending with blurred edges
-        mask = create_edge_blur_mask(cropped_frame.shape, blur_amount=30)
-        
-        # Blend the swapped region with the original cropped region
-        blended_region = blend_with_mask(cropped_frame, cropped_frame, mask)
+        enhanced_frame = enhance_face(cropped_frame)
 
         # Paste the swapped region back into the original frame
         x, y, w, h = crop_info
     
-        temp_frame[y:y+h, x:x+w] = blended_region
+        # Ensure dimensions match before pasting
+        if enhanced_frame.shape[0] != h or enhanced_frame.shape[1] != w:
+            enhanced_frame = cv2.resize(enhanced_frame, (w, h))
+
+        temp_frame[y:y+h, x:x+w] = enhanced_frame
 
     return temp_frame
 
