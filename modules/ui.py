@@ -248,7 +248,18 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     enhancer_value = ctk.BooleanVar(value=modules.globals.fp_ui['face_enhancer'])
     enhancer_switch = ctk.CTkSwitch(root, text='Face Enhancer', variable=enhancer_value, cursor='hand2',
                                     command=lambda: update_tumbler('face_enhancer', enhancer_value.get()))
-    enhancer_switch.place(relx=0.55, rely=y_start + 9.9*y_increment, relwidth=0.4)
+    enhancer_switch.place(relx=0.55, rely=y_start + 9.9*y_increment, relwidth=0.22)
+
+    # Face Enhancer Model dropdown
+    def update_enhancer_model(model: str):
+        modules.globals.face_enhancer_model = model.lower()
+
+    enhancer_model_var = ctk.StringVar(value=modules.globals.face_enhancer_model.upper())
+    enhancer_model_dropdown = ctk.CTkOptionMenu(root, values=["GFPGAN", "CODEFORMER", "GPEN"],
+                                                 variable=enhancer_model_var,
+                                                 command=update_enhancer_model,
+                                                 width=80)
+    enhancer_model_dropdown.place(relx=0.78, rely=y_start + 9.9*y_increment, relwidth=0.18)
 
 
     ##### Mouth Mask Frame
