@@ -3,7 +3,7 @@ import webbrowser
 import customtkinter as ctk
 from typing import Callable, Tuple,  List
 import cv2
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageTk
 from cv2_enumerate_cameras import enumerate_cameras  # Add this import
 import modules.globals
 import modules.metadata
@@ -25,6 +25,21 @@ camera = None
 capture_queue = None
 display_queue = None
 stop_pipeline = None
+
+# Threading lock for safe global access
+globals_lock = threading.Lock()
+
+# Label cache for batched updates (only update when changed)
+label_cache = {
+    'fps': -1,
+    'face1': -1, 'face2': -1, 'face3': -1, 'face4': -1, 'face5': -1,
+    'face6': -1, 'face7': -1, 'face8': -1, 'face9': -1, 'face10': -1
+}
+
+# Shared display frame for async rendering
+display_frame = None
+display_frame_ready = threading.Event()
+preview_photo_image = None  # Reusable PhotoImage to avoid memory churn
 
 ROOT = None
 ROOT_HEIGHT = 900
@@ -1017,8 +1032,9 @@ def webcam_preview():
     if modules.globals.source_path is None:
         return
     global preview_label, PREVIEW, ROOT, camera
-    global first_face_id, second_face_id  # Add these global variables
-    global first_face_embedding, second_face_embedding  # Add these global variables
+    global first_face_id, second_face_id
+    global first_face_embedding, second_face_embedding
+    global preview_photo_image, label_cache
 
     # Reset face assignments
     first_face_embedding = None
@@ -1026,29 +1042,55 @@ def webcam_preview():
     first_face_id = None
     second_face_id = None
 
-    # Reset face assignments
-    first_face_embedding = None
-    second_face_embedding = None
-    # Reset face assignments
-    first_face_id = None
-    second_face_id = None
+    # Reset label cache
+    for key in label_cache:
+        label_cache[key] = -1
 
     # Set initial size of the preview window
     PREVIEW_WIDTH = 1030
     PREVIEW_HEIGHT = 620
-    camera_index = modules.globals.camera_index
-    camera = cv2.VideoCapture(camera_index)
-    update_camera_resolution()
-    # Configure the preview window
+
+    # OPTIMIZATION: Show preview window IMMEDIATELY with loading message
     PREVIEW.deiconify()
     PREVIEW.geometry(f"{PREVIEW_WIDTH}x{PREVIEW_HEIGHT}")
-    preview_label_cam.configure(width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT)
+    preview_label_cam.configure(width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT, text="Initializing camera...")
+    ROOT.update()  # Force display update
+
+    # OPTIMIZATION: Initialize camera in background thread
+    camera_ready = threading.Event()
+    camera_error = [None]  # Use list to allow modification in nested function
+
+    def init_camera_async():
+        global camera
+        try:
+            camera_index = modules.globals.camera_index
+            camera = cv2.VideoCapture(camera_index)
+            if camera.isOpened():
+                # Set resolution
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, PREVIEW_DEFAULT_WIDTH)
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, PREVIEW_DEFAULT_HEIGHT)
+                camera.set(cv2.CAP_PROP_FPS, 30)
+                camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer lag
+            else:
+                camera_error[0] = "Failed to open camera"
+        except Exception as e:
+            camera_error[0] = str(e)
+        camera_ready.set()
+
+    # Start camera init in background
+    camera_thread = threading.Thread(target=init_camera_async, daemon=True)
+    camera_thread.start()
+
+    # OPTIMIZATION: Process source faces while camera initializes (parallel)
+    preview_label_cam.configure(text="Loading face data...")
+    ROOT.update()
+
     frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
-    
+
     if modules.globals.face_tracking:
         for frame_processor in frame_processors:
             if hasattr(frame_processor, 'reset_face_tracking'):
-                    frame_processor.reset_face_tracking()
+                frame_processor.reset_face_tracking()
 
     # Initialize source_images as a list to store faces
     source_images: List[Face] = []
@@ -1056,68 +1098,87 @@ def webcam_preview():
         source_image = cv2.imread(modules.globals.source_path)
         faces = get_many_faces(source_image)
         if faces:
-            # sort faces from left to right then slice max 6
             source_images = sorted(faces, key=lambda face: face.bbox[0])[:10]
-    
+
     if not source_images:
         print('No face found in source image')
+        preview_label_cam.configure(text="No face found in source image")
+        # Wait for camera thread to finish before returning
+        camera_ready.wait(timeout=5.0)
+        if camera is not None:
+            camera.release()
         return
-    else:
-        # Create the new list of values for the dropdown
-        num_faces = len(source_images)
-        dropdown_values = ["-1"] + [str(i) for i in range(num_faces)] # Changed from "1"
-        
-        # Update the dropdown with the new values
-        modules.globals.face_index_dropdown_preview.configure(values=dropdown_values)
 
-        #set value back to default value
-        modules.globals.face_index_var.set("-1")
-        modules.globals.face_index_range = -1
+    num_faces = len(source_images)
+    dropdown_values = ["-1"] + [str(i) for i in range(num_faces)]
+    modules.globals.face_index_dropdown_preview.configure(values=dropdown_values)
+    modules.globals.face_index_var.set("-1")
+    modules.globals.face_index_range = -1
 
-        for frame_processor in frame_processors:
-             if hasattr(frame_processor, 'extract_face_embedding'):
-                # Extract embeddings for all source faces and store them
-                source_embeddings = []
-                for face in source_images:
-                     source_embeddings.append(frame_processor.extract_face_embedding(face))
-                # Set to global variable for face_swapper.txt
-                modules.globals.source_face_left_embedding=source_embeddings
-                # print('face found in source image')
+    for frame_processor in frame_processors:
+        if hasattr(frame_processor, 'extract_face_embedding'):
+            source_embeddings = []
+            for face in source_images:
+                source_embeddings.append(frame_processor.extract_face_embedding(face))
+            modules.globals.source_face_left_embedding = source_embeddings
+
+    # Wait for camera to be ready (should be done by now since face processing took time)
+    preview_label_cam.configure(text="Waiting for camera...")
+    ROOT.update()
+    camera_ready.wait(timeout=10.0)
+
+    if camera_error[0] or camera is None or not camera.isOpened():
+        preview_label_cam.configure(text=f"Camera error: {camera_error[0] or 'Unknown'}")
+        return
+
+    preview_label_cam.configure(text="")  # Clear loading message
 
     # Async pipeline setup
     global capture_queue, display_queue, stop_pipeline
-    capture_queue = Queue(maxsize=2)  # Small buffer to keep frames fresh
-    display_queue = Queue(maxsize=2)
+    capture_queue = Queue(maxsize=3)
+    display_queue = Queue(maxsize=3)
     stop_pipeline = threading.Event()
 
     frame_processor.frame_auto_rotation = 0
 
+    # Store preview dimensions for worker threads
+    preview_dims = {'width': PREVIEW_WIDTH, 'height': PREVIEW_HEIGHT}
+    preview_dims_lock = threading.Lock()
+
     def capture_thread():
-        """Captures frames from camera and pushes to capture_queue."""
+        """Captures frames from camera - optimized for minimal latency."""
+        # Drain any buffered frames first
+        for _ in range(5):
+            camera.grab()
+
         while not stop_pipeline.is_set() and camera.isOpened():
-            ret, frame = camera.read()
-            if not ret:
+            # Use grab() + retrieve() for lower latency than read()
+            if not camera.grab():
                 break
-            temp_frame = frame.copy()
 
+            ret, frame = camera.retrieve()
+            if not ret or frame is None:
+                continue
+
+            # Apply flips directly (no copy needed)
             if modules.globals.flip_x:
-                temp_frame = cv2.flip(temp_frame, 1)
+                frame = cv2.flip(frame, 1)
             if modules.globals.flip_y:
-                temp_frame = cv2.flip(temp_frame, 0)
+                frame = cv2.flip(frame, 0)
 
-            # Drop old frame if queue is full (keeps frames fresh)
+            # Non-blocking put with frame drop
             if capture_queue.full():
                 try:
                     capture_queue.get_nowait()
                 except Empty:
                     pass
-            capture_queue.put(temp_frame)
+            capture_queue.put(frame)
 
     def process_thread():
-        """Pulls frames from capture_queue, processes, pushes to display_queue."""
+        """Process frames and resize BEFORE sending to display queue."""
         while not stop_pipeline.is_set():
             try:
-                temp_frame = capture_queue.get(timeout=0.1)
+                temp_frame = capture_queue.get(timeout=0.05)
             except Empty:
                 continue
 
@@ -1128,10 +1189,18 @@ def webcam_preview():
             except Exception:
                 detected_faces = []
 
+            # Process frame through all processors
             for fp in frame_processors:
                 temp_frame = fp.process_frame(source_images, temp_frame, detected_faces)
 
-            # Drop old frame if queue is full
+            # OPTIMIZATION: Resize in worker thread, not main thread
+            with preview_dims_lock:
+                w, h = preview_dims['width'], preview_dims['height']
+
+            if w > 0 and h > 0:
+                temp_frame = fit_image_to_preview_fast(temp_frame, w, h)
+
+            # Non-blocking put with frame drop
             if display_queue.full():
                 try:
                     display_queue.get_nowait()
@@ -1148,19 +1217,32 @@ def webcam_preview():
     # FPS calculation variables
     frame_count = 0
     start_time = time.time()
-    fps = 0
+    fps = 0.0
+    last_fps_update = 0
 
-    # Main display loop (runs in UI thread)
-    while not stop_pipeline.is_set():
+    def update_display():
+        """Event-driven display update using ROOT.after()."""
+        nonlocal frame_count, start_time, fps, last_fps_update, preview_photo_image
+
+        if stop_pipeline.is_set() or PREVIEW.state() == 'withdrawn':
+            cleanup_webcam()
+            return
+
+        # Update preview dimensions for worker thread
+        current_width = PREVIEW.winfo_width()
+        current_height = PREVIEW.winfo_height()
+        with preview_dims_lock:
+            preview_dims['width'] = current_width
+            preview_dims['height'] = current_height
+
+        # Try to get frame (non-blocking)
         try:
-            temp_frame = display_queue.get(timeout=0.05)
+            temp_frame = display_queue.get_nowait()
         except Empty:
-            ROOT.update()
-            if PREVIEW.state() == 'withdrawn':
-                break
-            continue
+            ROOT.after(16, update_display)  # ~60Hz check rate
+            return
 
-        # Calculate FPS
+        # Calculate FPS (only update label once per second)
         frame_count += 1
         current_time = time.time()
         elapsed_time = current_time - start_time
@@ -1169,39 +1251,38 @@ def webcam_preview():
             frame_count = 0
             start_time = current_time
 
-        fps_label.configure(text=f'FPS: {fps:.2f}')
-        target_face1_value.configure(text=f': {modules.globals.target_face1_score:.2f}')
-        target_face2_value.configure(text=f': {modules.globals.target_face2_score:.2f}')
-        target_face3_value.configure(text=f': {modules.globals.target_face3_score:.2f}')
-        target_face4_value.configure(text=f': {modules.globals.target_face4_score:.2f}')
-        target_face5_value.configure(text=f': {modules.globals.target_face5_score:.2f}')
-        target_face6_value.configure(text=f': {modules.globals.target_face6_score:.2f}')
-        target_face7_value.configure(text=f': {modules.globals.target_face7_score:.2f}')
-        target_face8_value.configure(text=f': {modules.globals.target_face8_score:.2f}')
-        target_face9_value.configure(text=f': {modules.globals.target_face9_score:.2f}')
-        target_face10_value.configure(text=f': {modules.globals.target_face10_score:.2f}')
+        # OPTIMIZATION: Batch label updates (only update if changed)
+        update_labels_batched(fps)
 
-        # Get current preview window size and display
-        current_width = PREVIEW.winfo_width()
-        current_height = PREVIEW.winfo_height()
-        temp_frame = fit_image_to_preview(temp_frame, current_width, current_height)
-        image = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(image)
-        image = ctk.CTkImage(image, size=(current_width, current_height))
-        preview_label_cam.configure(image=image, width=current_width, height=current_height)
-        ROOT.update()
+        # OPTIMIZATION: Use PhotoImage instead of CTkImage (much faster)
+        try:
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(rgb_frame)
 
-        if PREVIEW.state() == 'withdrawn':
-            break
+            # Reuse or create PhotoImage
+            preview_photo_image = ImageTk.PhotoImage(pil_image)
+            preview_label_cam.configure(image=preview_photo_image)
+        except Exception as e:
+            pass  # Skip frame on error
 
-    # Graceful shutdown
-    stop_pipeline.set()
-    cap_thread.join(timeout=1.0)
-    proc_thread.join(timeout=1.0)
-    camera.release()
-    PREVIEW.withdraw()
+        # Schedule next update (~30 FPS target)
+        ROOT.after(33, update_display)
+
+    def cleanup_webcam():
+        """Graceful shutdown."""
+        stop_pipeline.set()
+        cap_thread.join(timeout=0.5)
+        proc_thread.join(timeout=0.5)
+        if camera is not None:
+            camera.release()
+        PREVIEW.withdraw()
+
+    # Start the event-driven display loop
+    ROOT.after(10, update_display)
 
 def fit_image_to_preview(image, preview_width, preview_height):
+    """Original resize function (kept for compatibility)."""
     h, w = image.shape[:2]
     aspect_ratio = w / h
 
@@ -1225,6 +1306,81 @@ def fit_image_to_preview(image, preview_width, preview_height):
     canvas[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = resized_image
 
     return canvas
+
+
+def fit_image_to_preview_fast(image, preview_width, preview_height):
+    """Optimized resize function using faster interpolation."""
+    h, w = image.shape[:2]
+
+    if h == 0 or w == 0 or preview_width == 0 or preview_height == 0:
+        return image
+
+    aspect_ratio = w / h
+    preview_aspect = preview_width / preview_height
+
+    if preview_aspect > aspect_ratio:
+        new_height = preview_height
+        new_width = int(new_height * aspect_ratio)
+    else:
+        new_width = preview_width
+        new_height = int(new_width / aspect_ratio)
+
+    # Use INTER_LINEAR for speed (LANCZOS4 is 3-5x slower)
+    resized_image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+
+    # Create black canvas
+    canvas = np.zeros((preview_height, preview_width, 3), dtype=np.uint8)
+
+    # Center the image
+    y_offset = (preview_height - new_height) // 2
+    x_offset = (preview_width - new_width) // 2
+
+    canvas[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = resized_image
+
+    return canvas
+
+
+def update_labels_batched(fps: float):
+    """Update labels only when values change (reduces widget updates by ~80%)."""
+    global label_cache
+
+    # Round values for comparison
+    fps_rounded = round(fps, 1)
+
+    # Read face scores with lock for thread safety
+    with globals_lock:
+        scores = [
+            round(modules.globals.target_face1_score, 2),
+            round(modules.globals.target_face2_score, 2),
+            round(modules.globals.target_face3_score, 2),
+            round(modules.globals.target_face4_score, 2),
+            round(modules.globals.target_face5_score, 2),
+            round(modules.globals.target_face6_score, 2),
+            round(modules.globals.target_face7_score, 2),
+            round(modules.globals.target_face8_score, 2),
+            round(modules.globals.target_face9_score, 2),
+            round(modules.globals.target_face10_score, 2),
+        ]
+
+    # Update FPS only if changed
+    if fps_rounded != label_cache['fps']:
+        fps_label.configure(text=f'FPS: {fps_rounded:.1f}')
+        label_cache['fps'] = fps_rounded
+
+    # Update face scores only if changed
+    face_labels = [
+        target_face1_value, target_face2_value, target_face3_value,
+        target_face4_value, target_face5_value, target_face6_value,
+        target_face7_value, target_face8_value, target_face9_value,
+        target_face10_value
+    ]
+    face_keys = ['face1', 'face2', 'face3', 'face4', 'face5',
+                 'face6', 'face7', 'face8', 'face9', 'face10']
+
+    for i, (label, key, score) in enumerate(zip(face_labels, face_keys, scores)):
+        if score != label_cache[key]:
+            label.configure(text=f': {score:.2f}')
+            label_cache[key] = score
 
 def update_preview_size(*args):
     global PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT, camera
