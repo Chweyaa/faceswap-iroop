@@ -92,3 +92,8 @@ use_ink_filter_white=False
 use_ink_filter_black=False
 use_black_lines=False
 face_forehead_var=0.1
+
+# Shared face detection cache for live mode optimization
+# Stores detected faces to avoid redundant detection across processors
+cached_detected_faces = None
+cached_frame_id = None  # Track which frame the cache belongs to

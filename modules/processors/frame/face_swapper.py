@@ -563,7 +563,7 @@ def _process_face_tracking_many(
         else:
             return frame # If we have max faces then do not update the faces
 
-def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
+def process_frame(source_face: List[Face], temp_frame: Frame, detected_faces: List[Face] = None) -> Frame:
     """Main function to process a single frame."""
     global first_face_embedding, second_face_embedding, first_face_position, second_face_position
     global first_face_id, second_face_id
@@ -572,8 +572,11 @@ def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
     # Rotate the frame
     temp_frame = _rotate_frame(temp_frame, modules.globals.face_rot_range)
 
-    # Detect faces in the frame
-    all_faces = _detect_faces(temp_frame)
+    # Use pre-detected faces if provided (live mode optimization), otherwise detect
+    if detected_faces is not None:
+        all_faces = detected_faces
+    else:
+        all_faces = _detect_faces(temp_frame)
 
     # Handle face tracking reset logic
     if modules.globals.face_tracking: # If we're using face tracking

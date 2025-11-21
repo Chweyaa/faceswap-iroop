@@ -7,7 +7,7 @@ from PIL import Image, ImageOps
 from cv2_enumerate_cameras import enumerate_cameras  # Add this import
 import modules.globals
 import modules.metadata
-from modules.face_analyser import get_one_face, get_one_face_left, get_one_face_right,get_many_faces
+from modules.face_analyser import get_one_face, get_one_face_left, get_one_face_right, get_many_faces, get_face_analyser
 from modules.capturer import get_video_frame, get_video_frame_total
 from modules.processors.frame.core import get_frame_processors_modules
 
@@ -15,9 +15,16 @@ from modules.processors.frame.core import get_frame_processors_modules
 from modules.utilities import is_image, is_video, resolve_relative_path, has_image_extension
 import numpy as np
 import time
+import threading
+from queue import Queue, Empty
 
 global camera
 camera = None
+
+# Async pipeline globals for live mode
+capture_queue = None
+display_queue = None
+stop_pipeline = None
 
 ROOT = None
 ROOT_HEIGHT = 900
@@ -1066,35 +1073,91 @@ def webcam_preview():
                 modules.globals.source_face_left_embedding=source_embeddings
                 # print('face found in source image')
 
+    # Async pipeline setup
+    global capture_queue, display_queue, stop_pipeline
+    capture_queue = Queue(maxsize=2)  # Small buffer to keep frames fresh
+    display_queue = Queue(maxsize=2)
+    stop_pipeline = threading.Event()
+
+    frame_processor.frame_auto_rotation = 0
+
+    def capture_thread():
+        """Captures frames from camera and pushes to capture_queue."""
+        while not stop_pipeline.is_set() and camera.isOpened():
+            ret, frame = camera.read()
+            if not ret:
+                break
+            temp_frame = frame.copy()
+
+            if modules.globals.flip_x:
+                temp_frame = cv2.flip(temp_frame, 1)
+            if modules.globals.flip_y:
+                temp_frame = cv2.flip(temp_frame, 0)
+
+            # Drop old frame if queue is full (keeps frames fresh)
+            if capture_queue.full():
+                try:
+                    capture_queue.get_nowait()
+                except Empty:
+                    pass
+            capture_queue.put(temp_frame)
+
+    def process_thread():
+        """Pulls frames from capture_queue, processes, pushes to display_queue."""
+        while not stop_pipeline.is_set():
+            try:
+                temp_frame = capture_queue.get(timeout=0.1)
+            except Empty:
+                continue
+
+            # Detect faces once and share with all processors
+            try:
+                face_analyser = get_face_analyser()
+                detected_faces = face_analyser.get(temp_frame)
+            except Exception:
+                detected_faces = []
+
+            for fp in frame_processors:
+                temp_frame = fp.process_frame(source_images, temp_frame, detected_faces)
+
+            # Drop old frame if queue is full
+            if display_queue.full():
+                try:
+                    display_queue.get_nowait()
+                except Empty:
+                    pass
+            display_queue.put(temp_frame)
+
+    # Start worker threads
+    cap_thread = threading.Thread(target=capture_thread, daemon=True)
+    proc_thread = threading.Thread(target=process_thread, daemon=True)
+    cap_thread.start()
+    proc_thread.start()
+
     # FPS calculation variables
     frame_count = 0
     start_time = time.time()
     fps = 0
-    frame_processor.frame_auto_rotation=0
-    while camera.isOpened():
-        ret, frame = camera.read()
-        if not ret:
-            break
-        temp_frame = frame.copy()
-        
-        if modules.globals.flip_x:
-            temp_frame = cv2.flip(temp_frame, 1)
-        if modules.globals.flip_y:
-            temp_frame = cv2.flip(temp_frame, 0)
-        
-        for frame_processor in frame_processors:
-            temp_frame = frame_processor.process_frame(source_images, temp_frame)
-        
-        # # Calculate and display FPS
+
+    # Main display loop (runs in UI thread)
+    while not stop_pipeline.is_set():
+        try:
+            temp_frame = display_queue.get(timeout=0.05)
+        except Empty:
+            ROOT.update()
+            if PREVIEW.state() == 'withdrawn':
+                break
+            continue
+
+        # Calculate FPS
         frame_count += 1
         current_time = time.time()
         elapsed_time = current_time - start_time
-        if elapsed_time > 1:  # Update FPS every second
+        if elapsed_time > 1:
             fps = frame_count / elapsed_time
             frame_count = 0
             start_time = current_time
-        
-        #cv2.putText(temp_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
         fps_label.configure(text=f'FPS: {fps:.2f}')
         target_face1_value.configure(text=f': {modules.globals.target_face1_score:.2f}')
         target_face2_value.configure(text=f': {modules.globals.target_face2_score:.2f}')
@@ -1106,18 +1169,24 @@ def webcam_preview():
         target_face8_value.configure(text=f': {modules.globals.target_face8_score:.2f}')
         target_face9_value.configure(text=f': {modules.globals.target_face9_score:.2f}')
         target_face10_value.configure(text=f': {modules.globals.target_face10_score:.2f}')
-        # Get current preview window size
+
+        # Get current preview window size and display
         current_width = PREVIEW.winfo_width()
         current_height = PREVIEW.winfo_height()
-        # Resize the processed frame to fit the current preview window size
         temp_frame = fit_image_to_preview(temp_frame, current_width, current_height)
         image = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(image)
         image = ctk.CTkImage(image, size=(current_width, current_height))
         preview_label_cam.configure(image=image, width=current_width, height=current_height)
         ROOT.update()
+
         if PREVIEW.state() == 'withdrawn':
             break
+
+    # Graceful shutdown
+    stop_pipeline.set()
+    cap_thread.join(timeout=1.0)
+    proc_thread.join(timeout=1.0)
     camera.release()
     PREVIEW.withdraw()
 

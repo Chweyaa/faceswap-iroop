@@ -57,14 +57,17 @@ def enhance_face(temp_frame: Frame) -> Frame:
     return temp_frame
 
 
-def process_frame(source_face: Optional[Face], temp_frame: Frame) -> Frame:
-
-    face_analyser = get_face_analyser()
-    try:
-        all_faces = face_analyser.get(temp_frame)
-    except Exception as e:
-        # If face detection fails, return the original frame without processing
-        return temp_frame
+def process_frame(source_face: Optional[Face], temp_frame: Frame, detected_faces: Optional[list] = None) -> Frame:
+    # Use pre-detected faces if provided (live mode optimization)
+    if detected_faces is not None:
+        all_faces = detected_faces
+    else:
+        face_analyser = get_face_analyser()
+        try:
+            all_faces = face_analyser.get(temp_frame)
+        except Exception as e:
+            # If face detection fails, return the original frame without processing
+            return temp_frame
     
         # Determine which faces to process based on user settings
     if modules.globals.many_faces:
