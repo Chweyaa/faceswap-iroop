@@ -1222,7 +1222,8 @@ def webcam_preview():
 
     def update_display():
         """Event-driven display update using ROOT.after()."""
-        nonlocal frame_count, start_time, fps, last_fps_update, preview_photo_image
+        nonlocal frame_count, start_time, fps, last_fps_update
+        global preview_photo_image
 
         if stop_pipeline.is_set() or PREVIEW.state() == 'withdrawn':
             cleanup_webcam()
