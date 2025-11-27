@@ -1,4 +1,4 @@
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Dict
 import cv2  # This is a library for working with images and videos
 import insightface  # This is a library for detecting and analyzing faces
 import threading  # This helps run parts of the program at the same time
@@ -16,6 +16,7 @@ from modules.utilities import conditional_download, resolve_relative_path, is_im
 from collections import deque # A special list where items are added to one end and removed from the other
 import numpy as np # This is a library for math, especially with arrays
 import time # This is for keeping track of time
+from modules.profiler import profile_section
 
 # This is the thing that actually swaps the faces
 FACE_SWAPPER = None
@@ -23,6 +24,10 @@ FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 # This is the name of this part of the program
 NAME = 'DLC.FACE-SWAPPER'
+
+# Cache for edge blur masks to avoid recreating them for same-sized faces
+_MASK_CACHE: Dict[Tuple[int, int, int], Any] = {}
+_MASK_CACHE_MAX_SIZE = 50
 
 # How long to wait before swapping faces again (in seconds)
 COOLDOWN_PERIOD = 1.0  # 1 second cooldown
@@ -105,12 +110,39 @@ def get_face_swapper() -> Any:
     """
     global FACE_SWAPPER # Tells the program we are using the global FACE_SWAPPER variable
 
+    # Double-check locking pattern: avoid lock overhead when model already loaded
+    if FACE_SWAPPER is not None:
+        return FACE_SWAPPER
+
     with THREAD_LOCK: # This makes sure only one part of the program changes FACE_SWAPPER at a time
         if FACE_SWAPPER is None: # Checks if the face swapper hasn't been loaded yet
             model_path = resolve_relative_path('../models/inswapper_128_fp16.onnx') # Gets the path to the face swapper model
             # Loads the face swapper model
-            FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=modules.globals.execution_providers)
+            with profile_section('load_face_swapper_model'):
+                FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=modules.globals.execution_providers)
+            print(f"inswapper-shape: {FACE_SWAPPER.input_shape}")
     return FACE_SWAPPER
+
+
+def get_cached_edge_blur_mask(shape: Tuple[int, ...], blur_amount: int = 12) -> Any:
+    """Get or create a cached edge blur mask for the given shape."""
+    global _MASK_CACHE
+
+    cache_key = (shape[0], shape[1], blur_amount)
+
+    if cache_key in _MASK_CACHE:
+        return _MASK_CACHE[cache_key]
+
+    # Create new mask
+    mask = create_edge_blur_mask(shape, blur_amount=blur_amount)
+
+    # Cache management: remove oldest entries if cache is too large
+    if len(_MASK_CACHE) >= _MASK_CACHE_MAX_SIZE:
+        first_key = next(iter(_MASK_CACHE))
+        del _MASK_CACHE[first_key]
+
+    _MASK_CACHE[cache_key] = mask
+    return mask
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
@@ -119,21 +151,25 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     face_swapper = get_face_swapper() # Gets the face swapper model
 
     # Apply the face swap
-    swapped_frame = face_swapper.get(temp_frame, target_face, source_face, paste_back=True)
+    with profile_section('face_swap_model'):
+        swapped_frame = face_swapper.get(temp_frame, target_face, source_face, paste_back=True)
 
     # Create a mask for the target face
-    target_mask = create_face_mask(target_face, temp_frame)
+    with profile_section('create_face_mask'):
+        target_mask = create_face_mask(target_face, temp_frame)
 
     # Blur the edges of the mask
-    blurred_mask = blur_edges(target_mask)
+    with profile_section('blur_edges'):
+        blurred_mask = blur_edges(target_mask)
     blurred_mask = blurred_mask / 255.0 # Makes the mask values between 0 and 1
 
     # Ensure the mask has 3 channels to match the frame
     blurred_mask_3channel = np.repeat(blurred_mask[:, :, np.newaxis], 3, axis=2)
 
     # Blend the swapped face with the original frame using the blurred mask
-    blended_frame = (swapped_frame * blurred_mask_3channel +
-                     temp_frame * (1 - blurred_mask_3channel))
+    with profile_section('blend_swap'):
+        blended_frame = (swapped_frame * blurred_mask_3channel +
+                         temp_frame * (1 - blurred_mask_3channel))
 
     return blended_frame.astype(np.uint8) # Converts the blended frame back to a regular image
 
@@ -153,7 +189,8 @@ def _detect_faces(frame: Frame) -> List[Face]:
     """Detects faces in the given frame, returns an empty list if detection fails."""
     face_analyser = get_face_analyser() # Gets the face analyzer model
     try:
-        return face_analyser.get(frame) # Tries to detect faces and returns them as a list
+        with profile_section('face_detection'):
+            return face_analyser.get(frame) # Tries to detect faces and returns them as a list
     except Exception as e:
         print(f"Error detecting faces: {e}") # If there's a problem, prints an error message
         return [] # If there's an error, returns an empty list
@@ -212,18 +249,43 @@ def _get_source_index(i: int, source_face: List[Face], source_face_order: List[i
     else:
         return i % len(source_face) # If we only have one source face, always use that one
 
-def _process_face_swap(frame: Frame, source_face: List[Face], target_face: Face, source_index: int) -> Frame:
-    """Performs face swapping and masking on a single face."""
+def _process_face_swap(frame: Frame, source_face: List[Face], target_face: Face, source_index: int, enhance: bool = False) -> Frame:
+    """
+    Performs face swapping and masking on a single face.
+
+    Args:
+        frame: The frame to process
+        source_face: List of source faces
+        target_face: The target face to swap onto
+        source_index: Index of source face to use
+        enhance: If True, apply face enhancement after swapping (single-pass mode)
+    """
     # Crop the face region
     cropped_frame, crop_info = crop_face_region(frame, target_face) # Crops out the face region
+    original_cropped = cropped_frame.copy()  # Keep original for blending
     # Adjust the face bbox for the cropped frame
     adjusted_target_face = create_adjusted_face(target_face, crop_info) # Adjust the face information to the new cropped frame
     # Perform face swapping on the cropped region
     swapped_region = swap_face(source_face[source_index], adjusted_target_face, cropped_frame) # Swaps the faces
-    # Create a mask for blending with blurred edges
-    mask = create_edge_blur_mask(swapped_region.shape, blur_amount=BLUR_AMOUNT) # Creates a mask with feathered edges
+
+    # Single-pass enhancement: enhance the swapped face immediately
+    if enhance and modules.globals.fp_ui.get('face_enhancer', False):
+        try:
+            from modules.processors.frame.face_enhancer import enhance_face
+            original_size = (swapped_region.shape[1], swapped_region.shape[0])  # (width, height)
+            enhanced = enhance_face(swapped_region)
+            # GFPGAN outputs fixed 512x512, resize back to original crop size
+            if enhanced.shape[:2] != swapped_region.shape[:2]:
+                swapped_region = cv2.resize(enhanced, original_size, interpolation=cv2.INTER_LANCZOS4)
+            else:
+                swapped_region = enhanced
+        except Exception as e:
+            pass  # If enhancement fails, use unenhanced swapped region
+
+    # Use cached mask for better performance
+    mask = get_cached_edge_blur_mask(swapped_region.shape, blur_amount=BLUR_AMOUNT)
     # Blend the swapped region with the original cropped region
-    blended_region = blend_with_mask(swapped_region, cropped_frame, mask) # Blends the swapped face onto the original face
+    blended_region = blend_with_mask(swapped_region, original_cropped, mask) # Blends the swapped face onto the original face
     # Paste the swapped region back into the original frame
     x, y, w, h = crop_info # Gets the original position of the face
     frame[y:y + h, x:x + w] = blended_region # Puts the blended region back into the original frame
@@ -244,12 +306,12 @@ def _apply_mouth_masks(frame: Frame, target_faces: List[Face], mouth_masks: List
     return frame
 
 def _process_face_tracking_single(
-    frame: Frame, source_face: List[Face], target_face: Face, active_source_index: int
+    frame: Frame, source_face: List[Face], target_face: Face, active_source_index: int, enhance: bool = False
 ) -> Frame:
     """Handles single-face tracking logic using distance and embedding matching."""
     global first_face_embedding, first_face_position, first_face_id, face_lost_count
     global face_position_history, last_swap_time
-    
+
     current_time = time.time()
     target_embedding = extract_face_embedding(target_face)
     target_position = get_face_center(target_face)
@@ -264,7 +326,7 @@ def _process_face_tracking_single(
         face_position_history.clear()
         face_position_history.append(target_position)
         last_swap_time = current_time
-        return _process_face_swap(frame, source_face, target_face, active_source_index)
+        return _process_face_swap(frame, source_face, target_face, active_source_index, enhance=enhance)
     
     else:
         best_match_score = 0
@@ -278,18 +340,18 @@ def _process_face_tracking_single(
             if face_position_history and modules.globals.use_pseudo_face and best_match_score < modules.globals.pseudo_face_threshold:
                 avg_position = np.mean(face_position_history, axis=0)
                 pseudo_face = create_pseudo_face(avg_position)
-                return _process_face_swap(frame, source_face, pseudo_face, active_source_index)
+                return _process_face_swap(frame, source_face, pseudo_face, active_source_index, enhance=enhance)
             else:
                  return frame
-             
+
         for face in detected_faces:
-            
+
             target_embedding = extract_face_embedding(face)
             target_position = get_face_center(face)
 
             # Calculate embedding similarity
             embedding_similarity = cosine_similarity(first_face_embedding, target_embedding)
-            # Calculate position consistency score 
+            # Calculate position consistency score
             position_consistency = 1 / (1 + np.linalg.norm(np.array(target_position) - np.array(avg_position)) + 1e-6)
 
             # Calculate total match score
@@ -301,7 +363,7 @@ def _process_face_tracking_single(
             TOTAL_WEIGHT = EMBEDDING_WEIGHT * modules.globals.weight_distribution_size + POSITION_WEIGHT
             match_score = ((EMBEDDING_WEIGHT * embedding_similarity +
                             POSITION_WEIGHT * position_consistency) / TOTAL_WEIGHT)
-            
+
             if id(face) == first_face_id:
                 match_score *= (1 + STICKINESS_FACTOR)
 
@@ -313,25 +375,25 @@ def _process_face_tracking_single(
 
         if best_match_face is not None and best_match_score > modules.globals.sticky_face_value:
             face_lost_count = 0
-            
+
             # Update the embedding using weighted average
             first_face_embedding = OLD_WEIGHT * first_face_embedding + NEW_WEIGHT * extract_face_embedding(best_match_face)
             first_face_position = get_face_center(best_match_face)
             first_face_id = id(best_match_face)
             face_position_history.append(first_face_position)
-            
-            return _process_face_swap(frame, source_face, best_match_face, active_source_index)
+
+            return _process_face_swap(frame, source_face, best_match_face, active_source_index, enhance=enhance)
         else:
             face_lost_count += 1
             if face_position_history and modules.globals.use_pseudo_face and best_match_score < modules.globals.pseudo_face_threshold:
                 avg_position = np.mean(face_position_history, axis=0)
                 pseudo_face = create_pseudo_face(avg_position)
-                return _process_face_swap(frame, source_face, pseudo_face, active_source_index)
+                return _process_face_swap(frame, source_face, pseudo_face, active_source_index, enhance=enhance)
 
     return frame
 
 def _process_face_tracking_both(
-    frame: Frame, source_face: List[Face], target_face: Face, source_index: int, source_face_order: List[int]
+    frame: Frame, source_face: List[Face], target_face: Face, source_index: int, source_face_order: List[int], enhance: bool = False
 ) -> Frame:
     """Handles two-face tracking logic with flickering reduction, focusing on smoothing."""
     global first_face_embedding, second_face_embedding, first_face_position, second_face_position
@@ -430,12 +492,12 @@ def _process_face_tracking_both(
             else:
                 avg_position = target_position
             pseudo_face = create_pseudo_face(avg_position)
-            return _process_face_swap(frame, source_face, pseudo_face, source_index)    
+            return _process_face_swap(frame, source_face, pseudo_face, source_index, enhance=enhance)
         else:
             return frame
-        
+
     else:
-        
+
         # Initialization of one or both faces
         source_index = source_face_order[source_index % 2]
         if source_index % 2 == 0:
@@ -443,25 +505,25 @@ def _process_face_tracking_both(
             first_face_position = target_position
             first_face_id = face_id
             first_face_position_history.append(target_position)
-            
+
         else:
             second_face_embedding = target_embedding
             second_face_position = target_position
             second_face_id = face_id
             second_face_position_history.append(target_position)
-    
+
     if use_pseudo_face:
         if source_index == source_face_order[0]:
             avg_position = np.mean(first_face_position_history, axis=0) if first_face_position_history else first_face_position
         else:
             avg_position = np.mean(second_face_position_history, axis=0) if second_face_position_history else second_face_position
         pseudo_face = create_pseudo_face(avg_position)
-        return _process_face_swap(frame, source_face, pseudo_face, source_index)
+        return _process_face_swap(frame, source_face, pseudo_face, source_index, enhance=enhance)
     else:
-         return _process_face_swap(frame, source_face, target_face, source_index)
+         return _process_face_swap(frame, source_face, target_face, source_index, enhance=enhance)
 
 def _process_face_tracking_many(
-    frame: Frame, source_face: List[Face], target_face: Face, source_index: int, source_face_order: List[int]
+    frame: Frame, source_face: List[Face], target_face: Face, source_index: int, source_face_order: List[int], enhance: bool = False
 ) -> Frame:
     """Handles multi-face tracking logic for up to 10 faces with dynamic score updates."""
     global first_face_embedding, second_face_embedding, first_face_position, second_face_position
@@ -532,20 +594,20 @@ def _process_face_tracking_many(
         
         if best_match_key < 10:
             setattr(modules.globals, f"target_face{best_match_key + 1}_score", best_match_score)
-        
+
         source_index = best_match_key % len(source_face) # Correctly get index for multi faces
-        
-        return _process_face_swap(frame, source_face, target_face, source_index)
+
+        return _process_face_swap(frame, source_face, target_face, source_index, enhance=enhance)
 
     elif modules.globals.use_pseudo_face and best_match_score < modules.globals.pseudo_face_threshold:
-           
+
         use_pseudo_face = True
         avg_position = np.mean(position_histories_many[best_match_key], axis=0) if position_histories_many.get(best_match_key) else tracked_faces_many[best_match_key].get("position") if tracked_faces_many.get(best_match_key) else target_position
         pseudo_face = create_pseudo_face(avg_position)
         source_index = 0 if not source_face else 0 % len(source_face)
-        return _process_face_swap(frame, source_face, pseudo_face, source_index)
+        return _process_face_swap(frame, source_face, pseudo_face, source_index, enhance=enhance)
     else: # If no good match
-        
+
         if len(tracked_faces_many) < 10: # If we have less than 10 tracked faces, lets add the new face if it does not exist
            new_key = len(tracked_faces_many)
            tracked_faces_many[new_key] = {
@@ -556,10 +618,10 @@ def _process_face_tracking_many(
            position_histories_many[new_key] = deque(maxlen=30)
            position_histories_many[new_key].append(target_position)
            source_index = new_key % len(source_face)
-           
+
            if new_key < 10:
             setattr(modules.globals, f"target_face{new_key + 1}_score", 0.00)
-           return _process_face_swap(frame, source_face, target_face, source_index)
+           return _process_face_swap(frame, source_face, target_face, source_index, enhance=enhance)
         else:
             return frame # If we have max faces then do not update the faces
 
@@ -600,45 +662,48 @@ def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
     active_source_index = 1 if modules.globals.flip_faces else 0 # If we should flip the source faces
     source_face_order = [1, 0] if modules.globals.flip_faces else [0, 1] # If we should flip the source faces
 
+    # Determine if we should use single-pass enhancement
+    use_single_pass = modules.globals.single_pass_enhance and modules.globals.fp_ui.get('face_enhancer', False)
+
     if modules.globals.many_faces: # If we should swap many faces
          if modules.globals.face_tracking: # If we are tracking faces
             for i, target_face in enumerate(target_faces): # Loop through all the faces
                 if modules.globals.face_index_range != -1:
                     source_index= modules.globals.face_index_range
-                else: 
+                else:
                     source_index = i % len(source_face) # Get the index of the source face to use
-                temp_frame = _process_face_tracking_many(temp_frame, source_face, target_face, source_index, source_face_order )  # Track many faces
+                temp_frame = _process_face_tracking_many(temp_frame, source_face, target_face, source_index, source_face_order, enhance=use_single_pass)  # Track many faces
          else: # If we are not tracking faces
             for i, target_face in enumerate(target_faces): # Loop through all the faces
                 if modules.globals.face_index_range != -1:
                     source_index= modules.globals.face_index_range
-                else: 
+                else:
                     source_index = i % len(source_face)  # Get the index of the source face to use
-                temp_frame = _process_face_swap(temp_frame, source_face, target_face, source_index) # Swap the face
+                temp_frame = _process_face_swap(temp_frame, source_face, target_face, source_index, enhance=use_single_pass) # Swap the face
     else:
         faces_to_process = 2 if modules.globals.both_faces and len(source_face) > 1 else 1 # If we're swapping two faces, process two faces, otherwise process one
         for i in range(min(faces_to_process, len(target_faces))):
             if modules.globals.face_index_range != -1:
                 source_index= modules.globals.face_index_range
-            else: 
+            else:
                 source_index = _get_source_index(i, source_face, source_face_order) # Get the index of the source face to use
             if modules.globals.face_tracking: # If we're tracking faces
                 if modules.globals.both_faces: # If we're tracking two faces
                    temp_frame = _process_face_tracking_both(
-                        temp_frame, source_face, target_faces[i], source_index, source_face_order # Track both faces
+                        temp_frame, source_face, target_faces[i], source_index, source_face_order, enhance=use_single_pass # Track both faces
                     )
                 else:
                     if modules.globals.face_index_range != -1:
                         active_source_index= modules.globals.face_index_range
 
                     temp_frame = _process_face_tracking_single(
-                        temp_frame, source_face, target_faces[i], active_source_index # Track one face
+                        temp_frame, source_face, target_faces[i], active_source_index, enhance=use_single_pass # Track one face
                     )
 
             else: # If we're not tracking faces
                 if modules.globals.face_index_range != -1:
                     source_index= modules.globals.face_index_range
-                temp_frame = _process_face_swap(temp_frame, source_face, target_faces[i], source_index) # Swap the faces without tracking
+                temp_frame = _process_face_swap(temp_frame, source_face, target_faces[i], source_index, enhance=use_single_pass) # Swap the faces without tracking
 
     # Apply mouth masks
     temp_frame = _apply_mouth_masks(temp_frame, target_faces, mouth_masks, face_masks)
@@ -715,14 +780,17 @@ def process_frames(source_path: str, temp_frame_paths: List[str], progress: Any 
             source_face = sorted(faces, key=lambda face: face.bbox[0])[:10] # Sort the faces from left to right and take the first 10
 
     for temp_frame_path in temp_frame_paths: # Loop through all the frames
-        temp_frame = cv2.imread(temp_frame_path) # Load the current frame
+        with profile_section('frame_read'):
+            temp_frame = cv2.imread(temp_frame_path) # Load the current frame
         try:
             if modules.globals.flip_x: # If we should flip the frame horizontally
                 temp_frame = cv2.flip(temp_frame, 1) # Flip it
             if modules.globals.flip_y: # If we should flip the frame vertically
                 temp_frame = cv2.flip(temp_frame, 0) # Flip it
-            result = process_frame(source_face, temp_frame) # Process the current frame
-            cv2.imwrite(temp_frame_path, result) # Save the processed frame
+            with profile_section('frame_process_swap'):
+                result = process_frame(source_face, temp_frame) # Process the current frame
+            with profile_section('frame_write'):
+                cv2.imwrite(temp_frame_path, result) # Save the processed frame
         except Exception as exception:
             print(exception) # If there's an error, print it
             pass

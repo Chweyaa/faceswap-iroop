@@ -10,6 +10,7 @@ import modules.metadata
 from modules.face_analyser import get_one_face, get_one_face_left, get_one_face_right,get_many_faces
 from modules.capturer import get_video_frame, get_video_frame_total
 from modules.processors.frame.core import get_frame_processors_modules
+from modules.profiler import profile_section, print_stats, enable_profiler, fps_tracker
 
 
 from modules.utilities import is_image, is_video, resolve_relative_path, has_image_extension
@@ -1035,8 +1036,10 @@ def webcam_preview():
     # Initialize source_images as a list to store faces
     source_images: List[Face] = []
     if modules.globals.source_path:
-        source_image = cv2.imread(modules.globals.source_path)
-        faces = get_many_faces(source_image)
+        with profile_section('load_source_image'):
+            source_image = cv2.imread(modules.globals.source_path)
+        with profile_section('detect_source_faces'):
+            faces = get_many_faces(source_image)
         if faces:
             # sort faces from left to right then slice max 6
             source_images = sorted(faces, key=lambda face: face.bbox[0])[:10]
@@ -1071,29 +1074,54 @@ def webcam_preview():
     start_time = time.time()
     fps = 0
     frame_processor.frame_auto_rotation=0
+
+    # Print startup stats before entering main loop
+    print("\n*** WEBCAM PREVIEW STARTUP STATS ***")
+    print_stats(top_n=20)
+
+    # Reset profiler for webcam preview loop timing
+    enable_profiler()
+    profile_print_counter = 0
+
     while camera.isOpened():
-        ret, frame = camera.read()
+        with profile_section('camera_read'):
+            ret, frame = camera.read()
         if not ret:
             break
         temp_frame = frame.copy()
-        
+
         if modules.globals.flip_x:
             temp_frame = cv2.flip(temp_frame, 1)
         if modules.globals.flip_y:
             temp_frame = cv2.flip(temp_frame, 0)
-        
-        for frame_processor in frame_processors:
-            temp_frame = frame_processor.process_frame(source_images, temp_frame)
-        
+
+        with profile_section('total_frame_processing'):
+            for frame_processor in frame_processors:
+                if 'face_swapper' in str(type(frame_processor)):
+                    with profile_section('face_swapper_process'):
+                        temp_frame = frame_processor.process_frame(source_images, temp_frame)
+                elif 'face_enhancer' in str(type(frame_processor)):
+                    with profile_section('face_enhancer_process'):
+                        temp_frame = frame_processor.process_frame(source_images, temp_frame)
+                else:
+                    temp_frame = frame_processor.process_frame(source_images, temp_frame)
+
         # # Calculate and display FPS
         frame_count += 1
+        fps_tracker.tick()
         current_time = time.time()
         elapsed_time = current_time - start_time
         if elapsed_time > 1:  # Update FPS every second
             fps = frame_count / elapsed_time
             frame_count = 0
             start_time = current_time
-        
+
+        # Print profiler stats every 5 seconds
+        profile_print_counter += 1
+        if profile_print_counter >= int(fps * 5) if fps > 0 else 150:
+            print_stats(top_n=15)
+            profile_print_counter = 0
+
         #cv2.putText(temp_frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         fps_label.configure(text=f'FPS: {fps:.2f}')
         target_face1_value.configure(text=f': {modules.globals.target_face1_score:.2f}')
@@ -1110,16 +1138,22 @@ def webcam_preview():
         current_width = PREVIEW.winfo_width()
         current_height = PREVIEW.winfo_height()
         # Resize the processed frame to fit the current preview window size
-        temp_frame = fit_image_to_preview(temp_frame, current_width, current_height)
-        image = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(image)
-        image = ctk.CTkImage(image, size=(current_width, current_height))
-        preview_label_cam.configure(image=image, width=current_width, height=current_height)
-        ROOT.update()
+        with profile_section('ui_resize_frame'):
+            temp_frame = fit_image_to_preview(temp_frame, current_width, current_height)
+        with profile_section('ui_convert_image'):
+            image = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(image)
+            image = ctk.CTkImage(image, size=(current_width, current_height))
+        with profile_section('ui_update'):
+            preview_label_cam.configure(image=image, width=current_width, height=current_height)
+            ROOT.update()
         if PREVIEW.state() == 'withdrawn':
             break
     camera.release()
     PREVIEW.withdraw()
+    # Print final profiler stats
+    print("\n*** FINAL PROFILER STATS ***")
+    print_stats(top_n=25)
 
 def fit_image_to_preview(image, preview_width, preview_height):
     h, w = image.shape[:2]

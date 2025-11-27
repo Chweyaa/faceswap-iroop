@@ -92,3 +92,10 @@ use_ink_filter_white=False
 use_ink_filter_black=False
 use_black_lines=False
 face_forehead_var=0.1
+
+# Single-pass optimization: enhance faces during swap instead of separate pass
+# WARNING: Disabled by default - causes quality loss because:
+# 1. GFPGAN needs to detect the SWAPPED face, not the original target
+# 2. Resizing 512x512 output down to small crop loses detail
+# Enable only if speed matters more than quality
+single_pass_enhance = False

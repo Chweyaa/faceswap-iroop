@@ -21,6 +21,7 @@ import modules.ui as ui
 from modules.processors.frame.core import get_frame_processors_modules
 from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
 from modules.face_analyser import initialize_face_analyser
+from modules.profiler import enable_profiler, print_stats, profile_section
 
 if 'ROCMExecutionProvider' in modules.globals.execution_providers:
     del torch
@@ -187,11 +188,30 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     if not modules.globals.headless:
         ui.update_status(message)
 
+def should_skip_processor(frame_processor) -> bool:
+    """Check if a processor should be skipped due to single-pass optimization."""
+    # Skip face_enhancer when single-pass mode is enabled (enhancement done during swap)
+    if (hasattr(frame_processor, 'NAME') and
+        frame_processor.NAME == 'DLC.FACE-ENHANCER' and
+        modules.globals.single_pass_enhance and
+        modules.globals.fp_ui.get('face_enhancer', False)):
+        return True
+    return False
+
+
 def start() -> None:
+    # Enable profiler for processing
+    enable_profiler()
+
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_start():
             return
     update_status('Processing...')
+
+    # Log optimization mode
+    if modules.globals.single_pass_enhance and modules.globals.fp_ui.get('face_enhancer', False):
+        update_status('Single-pass optimization enabled: enhancement during swap')
+
     # process image to image
     if has_image_extension(modules.globals.target_path):
         if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
@@ -201,6 +221,9 @@ def start() -> None:
         except Exception as e:
             print("Error copying file:", str(e))
         for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
+            if should_skip_processor(frame_processor):
+                update_status('Skipping (single-pass mode)', frame_processor.NAME)
+                continue
             update_status('Progressing...', frame_processor.NAME)
             frame_processor.process_image(modules.globals.source_path, modules.globals.output_path, modules.globals.output_path)
             release_resources()
@@ -218,6 +241,9 @@ def start() -> None:
     extract_frames(modules.globals.target_path)
     temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
+        if should_skip_processor(frame_processor):
+            update_status('Skipping (single-pass mode)', frame_processor.NAME)
+            continue
         update_status('Progressing...', frame_processor.NAME)
         frame_processor.process_video(modules.globals.source_path, temp_frame_paths)
         release_resources()
@@ -246,6 +272,10 @@ def start() -> None:
     else:
         update_status('Processing to video failed!')
 
+    # Print profiler stats
+    print("\n*** VIDEO PROCESSING PROFILER STATS ***")
+    print_stats(top_n=25)
+
 
 def destroy(to_quit=True) -> None:
     if modules.globals.target_path:
@@ -254,20 +284,33 @@ def destroy(to_quit=True) -> None:
 
 
 def run() -> None:
-    parse_args()
+    with profile_section('parse_args'):
+        parse_args()
+
     if not pre_check():
         return
-    for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
-        if not frame_processor.pre_check():
-            return
-    limit_resources()
-        # Add the initialization here
+
+    with profile_section('frame_processor_pre_check'):
+        for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
+            if not frame_processor.pre_check():
+                return
+
+    with profile_section('limit_resources'):
+        limit_resources()
+
     # Initialize face analyser
     from modules.face_analyser import initialize_face_analyser
-    initialize_face_analyser()
+    with profile_section('init_face_analyser'):
+        initialize_face_analyser()
+
+    print("\n*** STARTUP PROFILER STATS ***")
+    print_stats(top_n=15)
 
     if modules.globals.headless:
         start()
     else:
-        window = ui.init(start, destroy)
+        with profile_section('ui_init'):
+            window = ui.init(start, destroy)
+        print("\n*** POST-UI INIT PROFILER STATS ***")
+        print_stats(top_n=15)
         window.mainloop()
