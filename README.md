@@ -93,7 +93,11 @@ The core idea is to use AI to analyze faces and their positions within a frame (
 
 ![face_index-jpg](images/faceindex.jpg)
 
-The Face Index dropdown allows you to select a specific face for single-face swapping. It is designed exclusively for single-face swapping and will override both the "Use Fist Two Source Faces" and "Use All Source Faces (10 Max)" options. When you choose a source image containing up to ten faces, this dropdown will automatically populate, enabling you to select the desired face for single face swapping. A value of -1 indicates the use of the automatic face selection system for "Use Fist Two Source Faces" and "Use All Source Faces (10 Max)" modes. When Ever you turn on these two options the Face Index is always set back to -1.
+The F1 dropdown allows you to select a specific face for single-face swapping. It is designed exclusively for single-face swapping and will override "Use All Source Faces (10 Max)" options. When you choose a source image containing up to ten faces, this dropdown will automatically populate, enabling you to select the desired face for single face swapping. A value of -1 indicates the use of the automatic face selection system for "Use All Source Faces (10 Max)" modes. When Ever you turn on this option the Face Index is always set back to -1.
+
+F2 is only enabled when you have "Use Fist Two Source Faces" option switch on. It allows you to choose which faces to use from F1 and F2.
+
+![face_index-jpg](images/faceindex2.jpg)
 
 When you enable "Use All Source Faces (10 Max)", the Face Index is automatically reset to -1. You can then adjust the Face Index to a specific value, and the selected face will be used to swap all detected faces in the target frame with the chosen face.
 
@@ -212,9 +216,11 @@ Finding the right balance of people on screen and tracking conditions may requir
 
 ![facerotation-jpg](images/facerotation.jpg)
 
-When swapping a face using the InsightFace A.I. in videos, images, or webcam feeds, the A.I. effectively handles face orientations within a specific range of angles: (-90°), (0°), and (+90°). If the face rotates beyond these angles, the A.I. may struggle to detect and process it accurately.
+When swapping faces in videos, images, or webcam feeds, the InsightFace A.I. works best within specific angle ranges: -90°, 0°, and +90°. Because the model was trained primarily on upright faces, it may struggle to detect or process faces that rotate beyond these angles.
 
-To manage extreme face orientations, you can utilize the rotation feature. For instance, if your subject is lying in bed with their face positioned horizontally, adjust the rotation range to either +90° or -90°, depending on the face's direction in the video. This ensures the face swap is applied correctly, even for unconventional orientations.
+To manage extreme orientations—such as a subject lying sideways in bed—you can use the Auto rotation feature to handle this automatically. Alternatively, you can turn Auto off and manually set the rotation range to +90° or -90°, depending on the face's direction. This ensures the face swap is applied correctly, even when the face is in an unconventional position.
+
+The **Freq** (Frequency) setting determines how often the A.I. checks the head's rotation. The default is 5, meaning it checks every 5 frames. If the subject's orientation isn't changing much, you can increase this number or simply turn off Auto rotation.
 
 ## How A.I. Face Swap Works and Key to Understanding InsightFace Rotations and its Limits (click image to watch video)
 
@@ -222,6 +228,19 @@ To manage extreme face orientations, you can utilize the rotation feature. For i
 
 ### click image to watch video [Roop Deep Fake Course](https://youtu.be/BzTqrIm69Ws?si=C4t7jL6CJ9JvdgX0)
 
+# FireFox extension to use with iRoopDeepFaceCam
+
+The included FireFox entension allows you to replace a face on any image/s on a webpage. When you start iRoopDeepFaceCam it will run a server which works with the  FireFox extension.
+
+![firefox_server-jpg](images/firefox_server.jpg)
+
+After you install the extension you can pin it and use it from FireFox on any webpage
+
+![firefox_extension-jpg](images/firefox_extension.jpg)
+
+FireFox entension can replace face/s on images on any webpage. The image is replaced in memory only. No file is saved.
+
+![firefox_faces-jpg](images/firefox_faces.jpg)
 
 ## How do I use it?
 > Note: When you run this program for the first time, it will download some models ~300MB in size.
@@ -655,3 +674,7 @@ sudo apt-get -y install cuda-toolkit-11-8
 - and [all developers](https://github.com/hacksider/Deep-Live-Cam/graphs/contributors) behind libraries used in this project.
 - Foot Note: [This is originally roop-cam, see the full history of the code here.](https://github.com/hacksider/roop-cam) Please be informed that the base author of the code is [s0md3v](https://github.com/s0md3v/roop)
 
+
+
+# Star History
+[![Star History Chart](https://api.star-history.com/svg?repos=iVideoGameBoss/iRoopDeepFaceCam&type=Date)](https://star-history.com/#iVideoGameBoss/iRoopDeepFaceCam&Date)

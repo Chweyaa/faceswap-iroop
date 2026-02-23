@@ -69,7 +69,8 @@ assignment_cooldown: float = 1.0  # 1 second cooldown
 
 # How many frames in a row a face has been lost (used in single-face tracking)
 face_lost_count = 0
-
+detection_frame_counter: int = 0
+cached_detected_faces: List[Face] = []
 
 def pre_check() -> bool:
     """
@@ -193,16 +194,42 @@ def _limit_target_faces(target_faces: List[Face]) -> List[Face]:
     max_faces = 2 if modules.globals.both_faces else 1 # If we're doing two faces, limit to 2, otherwise 1
     return target_faces[:max_faces]
 
-def _compute_mouth_masks(target_faces: List[Face], frame: Frame) -> List[Tuple[np.ndarray, np.ndarray, tuple, np.ndarray]]:
-    """Computes mouth masks for the target faces if needed."""
+def _compute_mouth_masks(target_faces: List[Face], frame: Frame) -> List[Tuple[np.ndarray, np.ndarray, tuple, tuple]]:
     mouth_masks = []
     face_masks = []
-    if modules.globals.mouth_mask: # If we're using mouth masks
-        for face in target_faces: # For each face we're swapping
-            face_mask = create_face_mask(face, frame) # Create the mask for the face
-            face_masks.append(face_mask) # Add it to the list
-            mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon = create_lower_mouth_mask(face, frame) # Create the mouth mask
-            mouth_masks.append((mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon)) # Add it to the list
+    
+    if modules.globals.mouth_mask:
+        for i, face in enumerate(target_faces):
+            # Check Granular Mask Control for 'Both Faces' mode
+            # i=0 is Left, i=1 is Right (because target_faces are sorted L->R)
+            process_this_face = True
+            
+            if modules.globals.both_faces:
+                option = modules.globals.mask_target_option # "Both", "Left", "Right"
+                if option == "Left" and i == 1: # Skip Right Face
+                    process_this_face = False
+                elif option == "Right" and i == 0: # Skip Left Face
+                    process_this_face = False
+            
+            # Check individual face toggle (Hotkeys 1-0)
+            if i < len(modules.globals.mouth_mask_enabled_faces):
+                if not modules.globals.mouth_mask_enabled_faces[i]:
+                    process_this_face = False
+
+            if process_this_face:
+                face_mask = create_face_mask(face, frame)
+                face_masks.append(face_mask)
+                
+                # Create the Hybrid Mask
+                mouth_mask, mouth_cutout, mouth_box, viz_masks = create_hybrid_mouth_mask(face, frame)
+                
+                # Append real data
+                mouth_masks.append((mouth_mask, mouth_cutout, mouth_box, viz_masks))
+            else:
+                # Append empty data so the indices stay aligned
+                face_masks.append(None)
+                mouth_masks.append((None, None, None, None))
+
     return mouth_masks, face_masks
 
 def _get_source_index(i: int, source_face: List[Face], source_face_order: List[int]) -> int:
@@ -216,6 +243,12 @@ def _process_face_swap(frame: Frame, source_face: List[Face], target_face: Face,
     """Performs face swapping and masking on a single face."""
     # Crop the face region
     cropped_frame, crop_info = crop_face_region(frame, target_face) # Crops out the face region
+    
+    # --- FIX START: Check for empty crop to prevent crash ---
+    if cropped_frame is None or cropped_frame.size == 0 or cropped_frame.shape[0] == 0 or cropped_frame.shape[1] == 0:
+        return frame
+    # --- FIX END ---
+
     # Adjust the face bbox for the cropped frame
     adjusted_target_face = create_adjusted_face(target_face, crop_info) # Adjust the face information to the new cropped frame
     # Perform face swapping on the cropped region
@@ -229,18 +262,69 @@ def _process_face_swap(frame: Frame, source_face: List[Face], target_face: Face,
     frame[y:y + h, x:x + w] = blended_region # Puts the blended region back into the original frame
     return frame
 
-def _apply_mouth_masks(frame: Frame, target_faces: List[Face], mouth_masks: List[Tuple[np.ndarray, np.ndarray, tuple, np.ndarray]], face_masks: List[np.ndarray]) -> Frame:
-    """Applies mouth masks to the frame if enabled."""
-    if modules.globals.mouth_mask: # If we're using mouth masks
-        for i, (mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon) in enumerate(mouth_masks): # Loop through the mouth masks
-            face_mask = face_masks[i] # Get the mask for the current face
-            landmarks = target_faces[i].landmark_2d_106 # Get the face landmarks
-            if landmarks is not None: # If landmarks exist
-                frame = apply_mouth_area(frame, mouth_cutout, mouth_box, face_mask, lower_lip_polygon) # Apply the mouth mask
-            else:
-                frame = apply_mouth_area(frame, mouth_cutout, mouth_box, face_mask, None) # Apply the mouth mask without landmarks
-            if modules.globals.show_mouth_mask_box: # If we should show the mouth mask box for debugging
-                frame = draw_mouth_mask_visualization(frame, target_faces[i], (mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon)) # Draw the visualization
+def _apply_mouth_masks(frame: Frame, target_faces: List[Face], mouth_masks: List[Tuple[np.ndarray, np.ndarray, tuple, tuple]], face_masks: List[np.ndarray]) -> Frame:
+    """Applies mouth masks and draws colored visualizations if debug is enabled."""
+    if modules.globals.mouth_mask:
+        for i, (mouth_mask, mouth_cutout, mouth_box, viz_masks) in enumerate(mouth_masks):
+            if mouth_mask is None or mouth_cutout is None:
+                continue
+
+            min_x, min_y, max_x, max_y = mouth_box
+            
+            # 1. Apply the standard mask swap (The logic remains the same)
+            if max_x <= frame.shape[1] and max_y <= frame.shape[0]:
+                roi = frame[min_y:max_y, min_x:max_x]
+                if roi.shape[:2] == mouth_cutout.shape[:2]:
+                    # Resize cutout if shapes don't match (dynamic bounds)
+                    pass 
+                else:
+                    mouth_cutout = cv2.resize(mouth_cutout, (roi.shape[1], roi.shape[0]))
+
+                color_corrected_mouth = apply_color_transfer(mouth_cutout, roi)
+                region_mask = mouth_mask[min_y:max_y, min_x:max_x]
+                if len(region_mask.shape) == 2:
+                    region_mask = region_mask[:, :, np.newaxis]
+                alpha = region_mask.astype(float) / 255.0
+                blended = (color_corrected_mouth * alpha + roi * (1.0 - alpha)).astype(np.uint8)
+                frame[min_y:max_y, min_x:max_x] = blended
+            
+            # 2. VISUALIZATION LOGIC (Colors!)
+            if modules.globals.show_mouth_mask_box and viz_masks[0] is not None:
+                smart_mask_full, geo_mask_full = viz_masks
+                
+                # Create a copy to draw shapes on
+                overlay = frame.copy()
+                
+                # A. Draw GEOMETRIC Mask (Padding/Top) in BLUE
+                # This shows what the sliders are doing
+                overlay[geo_mask_full > 0] = (255, 0, 0) # Blue BGR
+                
+                # B. Draw SMART Mask (Tongue) in RED
+                # This shows what the color detection is doing
+                overlay[smart_mask_full > 0] = (0, 0, 255) # Red BGR
+                
+                # C. Draw COMBINED Feathering in WHITE
+                # We find the difference between the feathered mask and a hard threshold
+                # to visualize the "blur" zone
+                _, hard_thresh = cv2.threshold(mouth_mask, 1, 255, cv2.THRESH_BINARY)
+                feather_zone = cv2.absdiff(mouth_mask, hard_thresh)
+                overlay[feather_zone > 20] = (255, 255, 255) # White glow for feather
+                
+                # Blend overlay with original frame (Transparency)
+                # 0.5 opacity
+                cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+                
+                # Add Outlines for clarity
+                contours_geo, _ = cv2.findContours(geo_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(frame, contours_geo, -1, (255, 0, 0), 2) # Blue Border
+                
+                contours_smart, _ = cv2.findContours(smart_mask_full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(frame, contours_smart, -1, (0, 0, 255), 2) # Red Border
+
+                # Add Text Labels
+                cv2.putText(frame, "PAD/TOP (Chin)", (min_x, max_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                cv2.putText(frame, "AUTO (Tongue)", (min_x, min_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
     return frame
 
 def _process_face_tracking_single(
@@ -330,6 +414,7 @@ def _process_face_tracking_single(
 
     return frame
 
+
 def _process_face_tracking_both(
     frame: Frame, source_face: List[Face], target_face: Face, source_index: int, source_face_order: List[int]
 ) -> Frame:
@@ -346,119 +431,181 @@ def _process_face_tracking_both(
     target_embedding = extract_face_embedding(target_face)
     target_position = get_face_center(target_face)
     face_id = id(target_face)
-    use_pseudo_face = False
+    
+    # Store tracked face data as a dictionary
+    # Globals for bounding boxes (Need to persist these)
+    global first_face_bbox, second_face_bbox
+    if 'first_face_bbox' not in globals(): globals()['first_face_bbox'] = None
+    if 'second_face_bbox' not in globals(): globals()['second_face_bbox'] = None
 
     # Store tracked face data as a dictionary
     tracked_faces = {
         0: {
             "embedding": first_face_embedding,
             "position": first_face_position,
+            "bbox": first_face_bbox,
             "id": first_face_id,
             "history": first_face_position_history
         },
         1: {
             "embedding": second_face_embedding,
             "position": second_face_position,
+            "bbox": second_face_bbox,
             "id": second_face_id,
             "history": second_face_position_history
         },
     }
     
-    if all(data["embedding"] is not None for data in tracked_faces.values()):
-       
-        best_match_score = -1
-        best_match_index = -1
-        
-        for i, (track_id, track_data) in enumerate(tracked_faces.items()):
-            
+    # 1. ATTEMPT MATCH AGAINST EXISTING TRACKS
+    best_match_score = -1
+    best_match_index = -1
+    
+    # --- FAST PATH: IOU CHECK ---
+    # If the face overlaps significantly with a known tracker, skip the heavy math.
+    iou_threshold = 0.50  # 50% overlap means it's likely the same face
+    
+    for track_id, track_data in tracked_faces.items():
+        if track_data["bbox"] is not None:
+            iou = calculate_iou(target_face.bbox, track_data["bbox"])
+            if iou > iou_threshold:
+                # High confidence match based on position
+                best_match_index = track_id
+                best_match_score = 100.0 # Force high score
+                break
+    
+    # --- ROBUST PATH: EMBEDDING CHECK ---
+    # If IOU didn't find a match (face moved fast, or first frame), do the heavy lifting
+    if best_match_index == -1:
+        EMBEDDING_WEIGHT = modules.globals.embedding_weight_size
+        POSITION_WEIGHT = modules.globals.position_size
+        total = modules.globals.old_embedding_weight + modules.globals.new_embedding_weight
+        OLD_WEIGHT = modules.globals.old_embedding_weight / total
+        NEW_WEIGHT = modules.globals.new_embedding_weight / total
+        TOTAL_WEIGHT = EMBEDDING_WEIGHT * modules.globals.weight_distribution_size + POSITION_WEIGHT
+    
+        for track_id, track_data in tracked_faces.items():
             track_embedding = track_data["embedding"]
             track_position = track_data["position"]
             track_history = track_data["history"]
             
-            if track_embedding is not None and track_position is not None:
-            
+            if track_embedding is not None:
                 similarity = cosine_similarity(track_embedding, target_embedding)
                 position_consistency = 1 / (1 + np.linalg.norm(np.array(target_position) - np.array(np.mean(track_history, axis=0) if track_history else track_position))) if track_position is not None else 0
                 
-                EMBEDDING_WEIGHT = modules.globals.embedding_weight_size
-                POSITION_WEIGHT = modules.globals.position_size
-                total = modules.globals.old_embedding_weight + modules.globals.new_embedding_weight
-                OLD_WEIGHT = modules.globals.old_embedding_weight / total
-                NEW_WEIGHT = modules.globals.new_embedding_weight / total
-                TOTAL_WEIGHT = EMBEDDING_WEIGHT * modules.globals.weight_distribution_size + POSITION_WEIGHT
-                
                 score = ((EMBEDDING_WEIGHT * similarity +
                             POSITION_WEIGHT * position_consistency) / TOTAL_WEIGHT)
+                
                 if track_data["id"] == face_id:
                     score *= (1 + STICKINESS_FACTOR)
                     
                 if score > best_match_score:
                     best_match_score = score
                     best_match_index = track_id
-        
-        
-        if best_match_index != -1 and best_match_score > modules.globals.sticky_face_value:
-            
-            tracked_face = tracked_faces[best_match_index]
-            
-            # Update the tracked face with a weighted average of the new embedding
-            tracked_face["embedding"] =  OLD_WEIGHT * tracked_face["embedding"] + NEW_WEIGHT * target_embedding
-            
-            #Update position with weighted average
-            avg_position = np.mean(tracked_face["history"], axis=0) if tracked_face["history"] else tracked_face["position"]
-            if avg_position is not None:
-                tracked_face["position"] = np.array(avg_position) * 0.8 + np.array(target_position) * 0.2
-            else:
-                tracked_face["position"] = np.array(target_position)
-            tracked_face["id"] = face_id
-            tracked_face["history"].append(target_position)
-            
-            if best_match_index == 0:
-                modules.globals.target_face1_score = best_match_score
-            elif best_match_index == 1:
-               modules.globals.target_face2_score = best_match_score
-               
-            source_index = source_face_order[best_match_index]
-            
-
-        elif modules.globals.use_pseudo_face and best_match_score < modules.globals.pseudo_face_threshold:
-            use_pseudo_face = True
-            if best_match_index == 0:
-                avg_position = np.mean(first_face_position_history, axis=0) if first_face_position_history else first_face_position
-            elif best_match_index == 1:
-                avg_position = np.mean(second_face_position_history, axis=0) if second_face_position_history else second_face_position
-            else:
-                avg_position = target_position
-            pseudo_face = create_pseudo_face(avg_position)
-            return _process_face_swap(frame, source_face, pseudo_face, source_index)    
-        else:
-            return frame
-        
     else:
+        # Define weights if we took fast path, so the update logic below works
+        total = modules.globals.old_embedding_weight + modules.globals.new_embedding_weight
+        OLD_WEIGHT = modules.globals.old_embedding_weight / total
+        NEW_WEIGHT = modules.globals.new_embedding_weight / total
+
+    matched_track_id = -1
+    use_pseudo_face = False
+
+    # 2. DECIDE: MATCH, INIT, OR PSEUDO
+    if best_match_index != -1 and best_match_score > modules.globals.sticky_face_value:
+        # Match found
+        matched_track_id = best_match_index
         
-        # Initialization of one or both faces
-        source_index = source_face_order[source_index % 2]
-        if source_index % 2 == 0:
+        # Update Track
+        # Update Track
+        tracked_face = tracked_faces[matched_track_id]
+        
+        # Only do heavy embedding updates if we didn't use the fast path (score 100 means fast path)
+        if best_match_score != 100.0:
+             tracked_face["embedding"] = OLD_WEIGHT * tracked_face["embedding"] + NEW_WEIGHT * target_embedding
+        
+        # Always update position and bbox
+        avg_position = np.mean(tracked_face["history"], axis=0) if tracked_face["history"] else tracked_face["position"]
+        if avg_position is not None:
+            tracked_face["position"] = np.array(avg_position) * 0.8 + np.array(target_position) * 0.2
+        else:
+            tracked_face["position"] = np.array(target_position)
+            
+        tracked_face["bbox"] = target_face.bbox # SAVE THE BOX FOR IOU
+        tracked_face["id"] = face_id
+        tracked_face["history"].append(target_position)
+        
+        # Sync Globals
+        if matched_track_id == 0:
+            first_face_bbox = target_face.bbox
+        else:
+            second_face_bbox = target_face.bbox
+        
+        # Update Scores Global
+        if matched_track_id == 0:
+            modules.globals.target_face1_score = best_match_score
+        else:
+            modules.globals.target_face2_score = best_match_score
+
+    else:
+        # No match, try to initialize an empty track
+        if first_face_embedding is None:
+            # Init Track 0
+            matched_track_id = 0
             first_face_embedding = target_embedding
             first_face_position = target_position
             first_face_id = face_id
             first_face_position_history.append(target_position)
-            
-        else:
+        elif second_face_embedding is None:
+            # Init Track 1
+            matched_track_id = 1
             second_face_embedding = target_embedding
             second_face_position = target_position
             second_face_id = face_id
             second_face_position_history.append(target_position)
+        elif modules.globals.use_pseudo_face and best_match_score < modules.globals.pseudo_face_threshold:
+            # Both full, pseudo face fallback
+            use_pseudo_face = True
+            matched_track_id = best_match_index # Use best bad match for pseudo location
     
-    if use_pseudo_face:
-        if source_index == source_face_order[0]:
-            avg_position = np.mean(first_face_position_history, axis=0) if first_face_position_history else first_face_position
+    # 3. DETERMINE SOURCE INDEX (Applying Flip Logic)
+    if matched_track_id != -1:
+        # Resolve explicit user selections
+        selection_1 = modules.globals.face_index_range
+        if selection_1 == -1: selection_1 = 0
+        
+        selection_2 = 0
+        if hasattr(modules.globals, 'face2_index_range'):
+            selection_2 = modules.globals.face2_index_range
+        
+        final_idx = 0
+        
+        # Apply Logic:
+        # Track 0 (Left/F1) -> Normal: Sel1, Flip: Sel2
+        # Track 1 (Right/F2) -> Normal: Sel2, Flip: Sel1
+        
+        if matched_track_id == 0:
+            if modules.globals.flip_faces:
+                final_idx = selection_2
+            else:
+                final_idx = selection_1
+        elif matched_track_id == 1:
+            if modules.globals.flip_faces:
+                final_idx = selection_1
+            else:
+                final_idx = selection_2
+
+        # 4. SWAP
+        if use_pseudo_face:
+            # Generate pseudo face at track location
+            track_hist = tracked_faces[matched_track_id]["history"]
+            track_pos = tracked_faces[matched_track_id]["position"]
+            avg_pos = np.mean(track_hist, axis=0) if track_hist else track_pos
+            pseudo_face = create_pseudo_face(avg_pos)
+            return _process_face_swap(frame, source_face, pseudo_face, final_idx)
         else:
-            avg_position = np.mean(second_face_position_history, axis=0) if second_face_position_history else second_face_position
-        pseudo_face = create_pseudo_face(avg_position)
-        return _process_face_swap(frame, source_face, pseudo_face, source_index)
-    else:
-         return _process_face_swap(frame, source_face, target_face, source_index)
+            return _process_face_swap(frame, source_face, target_face, final_idx)
+            
+    return frame
 
 def _process_face_tracking_many(
     frame: Frame, source_face: List[Face], target_face: Face, source_index: int, source_face_order: List[int]
@@ -568,12 +715,26 @@ def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
     global first_face_embedding, second_face_embedding, first_face_position, second_face_position
     global first_face_id, second_face_id
     global first_face_lost_count, second_face_lost_count
+    # Optimization Globals
+    global detection_frame_counter, cached_detected_faces
 
     # Rotate the frame
     temp_frame = _rotate_frame(temp_frame, modules.globals.face_rot_range)
 
-    # Detect faces in the frame
-    all_faces = _detect_faces(temp_frame)
+    # --- OPTIMIZATION: DETECTION SKIPPING ---
+    # Only run heavy face detection once every 3 frames.
+    # On the frames in between, use the cached faces.
+    detection_frame_counter += 1
+    
+    # If the counter is 0 (first run) or it's the 3rd frame, OR we don't have cached faces yet
+    if detection_frame_counter % modules.globals.detection_frequency == 0 or not cached_detected_faces:
+        all_faces = _detect_faces(temp_frame)
+        # Update cache regardless. If no faces found, cache becomes empty.
+        cached_detected_faces = all_faces
+    else:
+        # Use the faces found in the previous frame
+        all_faces = cached_detected_faces
+    # ----------------------------------------
 
     # Handle face tracking reset logic
     if modules.globals.face_tracking: # If we're using face tracking
@@ -587,13 +748,21 @@ def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
         reset_face_tracking() # Reset the face tracking
         modules.globals.face_tracking_value = False # Set the button to false
 
-    # Select which faces to process
-    target_faces = _select_target_faces(all_faces)
-
-    # Limit number of faces
-    target_faces = _limit_target_faces(target_faces)
+     # Select which faces to process
+    if modules.globals.face_tracking and modules.globals.both_faces:
+         # If tracking both, we MUST look at ALL faces to find the tracks, 
+         # regardless of position.
+         if modules.globals.detect_face_right:
+             target_faces = sorted(all_faces, key=lambda face: -face.bbox[0])
+         else:
+             target_faces = sorted(all_faces, key=lambda face: face.bbox[0])
+    else:
+        # Standard Selection (Strict Limits)
+        target_faces = _select_target_faces(all_faces)
+        target_faces = _limit_target_faces(target_faces)
 
     # Pre-compute mouth masks if needed
+    # Note: _compute_mouth_masks logic handles variable length lists safely
     mouth_masks, face_masks = _compute_mouth_masks(target_faces, temp_frame)
 
     # Determine source face order
@@ -616,8 +785,16 @@ def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
                     source_index = i % len(source_face)  # Get the index of the source face to use
                 temp_frame = _process_face_swap(temp_frame, source_face, target_face, source_index) # Swap the face
     else:
-        faces_to_process = 2 if modules.globals.both_faces and len(source_face) > 1 else 1 # If we're swapping two faces, process two faces, otherwise process one
-        for i in range(min(faces_to_process, len(target_faces))):
+        # Determine loop range
+        if modules.globals.face_tracking and modules.globals.both_faces:
+             # Loop over ALL candidates to find the tracks
+             loop_range = len(target_faces)
+        else:
+             # Standard limit
+             faces_to_process = 2 if modules.globals.both_faces and len(source_face) > 1 else 1 
+             loop_range = min(faces_to_process, len(target_faces))
+
+        for i in range(loop_range):
             if modules.globals.face_index_range != -1:
                 source_index= modules.globals.face_index_range
             else: 
@@ -638,15 +815,36 @@ def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
             else: # If we're not tracking faces
                 if modules.globals.face_index_range != -1:
                     source_index= modules.globals.face_index_range
-                temp_frame = _process_face_swap(temp_frame, source_face, target_faces[i], source_index) # Swap the faces without tracking
+                if modules.globals.both_faces:
+                    # Resolve explicit selections
+                    selection_1 = modules.globals.face_index_range
+                    if selection_1 == -1: selection_1 = 0
+                    
+                    selection_2 = 0
+                    if hasattr(modules.globals, 'face2_index_range'):
+                        selection_2 = modules.globals.face2_index_range
+                    
+                    final_idx = 0
+                    
+                    if i == 0: # Left Target
+                        if modules.globals.flip_faces:
+                            final_idx = selection_2 # Flip: Get F2's selection
+                        else:
+                            final_idx = selection_1 # Normal: Get F1's selection
+                    elif i == 1: # Right Target
+                        if modules.globals.flip_faces:
+                            final_idx = selection_1 # Flip: Get F1's selection
+                        else:
+                            final_idx = selection_2 # Normal: Get F2's selection
 
+                    temp_frame = _process_face_swap(temp_frame, source_face, target_faces[i], final_idx)
+                else:
+                    temp_frame = _process_face_swap(temp_frame, source_face, target_faces[i], source_index) # Swap the faces without
     # Apply mouth masks
     temp_frame = _apply_mouth_masks(temp_frame, target_faces, mouth_masks, face_masks)
 
     # Draw face boxes and landmarks if enabled
     if modules.globals.show_target_face_box:
-        # face_analyser = get_face_analyser()
-        # temp_frame = face_analyser.draw_on(temp_frame, target_faces)
         for face in target_faces:
             temp_frame = draw_all_landmarks(temp_frame, face) # Draw the face landmarks
 
@@ -664,7 +862,6 @@ def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
         modules.globals.use_black_lines=True
         temp_frame = apply_ink_filter(temp_frame)
 
-    
     return temp_frame
 
 def apply_pencil_filter(frame: Frame) -> Frame:
@@ -1093,6 +1290,7 @@ def reset_face_tracking():
     """
     global first_face_embedding, second_face_embedding
     global first_face_position, second_face_position
+    global first_face_bbox, second_face_bbox
     global first_face_id, second_face_id
     global first_face_lost_count, second_face_lost_count
     global face_position_history
@@ -1109,10 +1307,11 @@ def reset_face_tracking():
     second_face_embedding = None
     first_face_position = None
     second_face_position = None
+    first_face_bbox = None
+    second_face_bbox = None
     first_face_id = None
     second_face_id = None
     first_face_lost_count = 0
-    second_face_lost_count = 0
     face_position_history.clear()
     
     modules.globals.target_face1_score = 0.00
@@ -1563,3 +1762,172 @@ def get_two_faces(frame: Frame) -> List[Face]:
         sorted_faces = sorted(faces, key=lambda x: x.bbox[0]) # Sort the faces from left to right
         return sorted_faces[:2]  # Return up to two faces, leftmost and rightmost
     return [] # If no faces were detected, return an empty list
+
+def calculate_iou(boxA, boxB):
+    """
+    Calculates Intersection over Union (IOU) between two bounding boxes.
+    """
+    # determine the (x, y)-coordinates of the intersection rectangle
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    # compute the area of intersection rectangle
+    interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
+
+    # compute the area of both the prediction and ground-truth rectangles
+    boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
+    boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
+
+    # compute the intersection over union by taking the intersection
+    # area and dividing it by the sum of prediction + ground-truth
+    # areas - the interesection area
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+
+    return iou
+
+def estimate_head_rotation(face: Face) -> float:
+    """
+    Calculates the head rotation angle in degrees relative to the vertical axis.
+    Returns 0.0 if landmarks are missing.
+    """
+    if face.landmark_2d_106 is None:
+        return 0.0
+
+    landmarks = face.landmark_2d_106.astype(np.int32)
+    
+    # Use nose bridge (72) and nose tip (80) to determine angle
+    if len(landmarks) < 81:
+         return 0.0
+
+    point_72 = landmarks[72]
+    point_80 = landmarks[80]
+
+    dx = point_72[0] - point_80[0]
+    dy = point_72[1] - point_80[1]
+
+    angle_radians = math.atan2(-dx, -dy)
+    angle_degrees = math.degrees(angle_radians)
+
+    # Normalize angle
+    if angle_degrees > 180:
+        angle_degrees -= 360
+    elif angle_degrees < -180:
+        angle_degrees += 360
+        
+    return angle_degrees
+
+def create_hybrid_mouth_mask(face: Face, frame: Frame) -> Tuple[np.ndarray, np.ndarray, tuple, tuple]:
+    """
+    Hybrid Mask logic:
+    1. Smart Color Detection (Red/Tongue).
+    2. Geometric Mask (Blue Circle) -> PINNED below the NOSE (Landmark 80).
+    3. Standard Gaussian Feathering (Blurs Outward & Inward).
+    """
+    h, w = frame.shape[:2]
+    final_mask = np.zeros((h, w), dtype=np.uint8)
+    
+    # Visualization masks
+    smart_mask_full = np.zeros((h, w), dtype=np.uint8)
+    geo_mask_full = np.zeros((h, w), dtype=np.uint8)
+    
+    mouth_cutout = None
+
+    landmarks = face.landmark_2d_106
+    if landmarks is not None:
+        # --- PART A: SMART COLOR MASK (Red/Tongue) ---
+        mouth_points = landmarks[52:71].astype(np.int32)
+        min_x, min_y = np.min(mouth_points, axis=0)
+        max_x, max_y = np.max(mouth_points, axis=0)
+        
+        pad = int((max_x - min_x) * 0.2)
+        r_min_x, r_min_y = max(0, min_x - pad), max(0, min_y - pad)
+        r_max_x, r_max_y = min(w, max_x + pad), min(h, max_y + pad)
+        
+        mouth_roi = frame[r_min_y:r_max_y, r_min_x:r_max_x]
+        
+        if mouth_roi.size > 0:
+            hsv_roi = cv2.cvtColor(mouth_roi, cv2.COLOR_BGR2HSV)
+            # Red/Pink
+            mask1 = cv2.inRange(hsv_roi, np.array([0, 60, 60]), np.array([15, 255, 255]))
+            mask2 = cv2.inRange(hsv_roi, np.array([160, 60, 60]), np.array([180, 255, 255]))
+            # Dark Interior
+            mask3 = cv2.inRange(hsv_roi, np.array([0, 0, 0]), np.array([180, 255, 80]))
+            
+            smart_mask_roi = cv2.bitwise_or(mask1, mask2)
+            smart_mask_roi = cv2.bitwise_or(smart_mask_roi, mask3)
+            
+            smart_mask_full[r_min_y:r_max_y, r_min_x:r_max_x] = smart_mask_roi
+            final_mask[r_min_y:r_max_y, r_min_x:r_max_x] = smart_mask_roi
+
+        # --- PART B: GEOMETRIC MASK (The Eating Oval) ---
+        padding_val = modules.globals.mask_down_size
+        top_val = int(modules.globals.mask_size)
+        
+        # 1. Radius/Size Calculation
+        mouth_width = np.linalg.norm(landmarks[52] - landmarks[61])
+        
+        radius_scale = (padding_val - 0.4) * 1.5 
+        if radius_scale < 0: radius_scale = 0
+        
+        radius_w = int(mouth_width * radius_scale * 1.2)
+        radius_h = int(mouth_width * radius_scale * 1.0)
+        
+        # 2. Determine Anchor Points
+        chin_indices = [65, 66, 62, 70, 69, 18, 19, 20, 21, 22, 23, 24, 0, 8, 7, 6, 5, 4, 3, 2]
+        chin_points = landmarks[chin_indices].astype(np.float32)
+        center = np.mean(chin_points, axis=0)
+        
+        center_x = center[0]
+        center_y = center[1] + (top_val * 4)
+
+        # 3. PINNING LOGIC (Below Nose Tip 80)
+        nose_tip_y = landmarks[80][1]
+        upper_lip_y = landmarks[71][1]
+        
+        # Philtrum buffer (20%)
+        philtrum_h = upper_lip_y - nose_tip_y
+        pin_limit_y = nose_tip_y + (philtrum_h * 0.2)
+        
+        current_oval_top = center_y - radius_h
+        
+        # Slide down if hitting nose limit
+        if current_oval_top < pin_limit_y:
+            shift_needed = pin_limit_y - current_oval_top
+            center_y = center_y + shift_needed
+        
+        # 4. Draw Oval
+        if radius_w > 0 and radius_h > 0:
+            cv2.ellipse(
+                geo_mask_full, 
+                (int(center_x), int(center_y)), 
+                (radius_w, radius_h), 
+                0, 0, 360, 
+                255, -1
+            )
+            
+        # --- PART C: COMBINE ---
+        final_mask = cv2.bitwise_or(final_mask, geo_mask_full)
+        
+        # --- PART D: STANDARD FEATHERING (Outward + Inward) ---
+        # Reverted to GaussianBlur for natural blending
+        feather_val = int(modules.globals.mask_feather_ratio)
+        if feather_val > 0:
+            k_size = (feather_val * 2) + 1
+            final_mask = cv2.GaussianBlur(final_mask, (k_size, k_size), 0)
+
+        # Cutout logic
+        coords = cv2.findNonZero(final_mask)
+        if coords is not None:
+            x, y, w, h_rect = cv2.boundingRect(coords)
+            x = max(0, x - 10)
+            y = max(0, y - 10)
+            w = min(frame.shape[1] - x, w + 20)
+            h_rect = min(frame.shape[0] - y, h_rect + 20)
+            
+            mouth_cutout = frame[y:y+h_rect, x:x+w].copy()
+            
+            return final_mask, mouth_cutout, (x, y, x+w, y+h_rect), (smart_mask_full, geo_mask_full)
+
+    return final_mask, None, (0,0,0,0), (None, None)

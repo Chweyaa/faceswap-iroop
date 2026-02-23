@@ -9,6 +9,7 @@ file_types = [
     ('Video', ('*.mp4','*.mkv'))
 ]
 
+
 source_path = None
 target_path = None
 output_path = None
@@ -39,8 +40,8 @@ detect_face_right = None
 detect_face_right_value = False
 show_target_face_box = None
 mouth_mask=False
-mask_feather_ratio=8
-mask_down_size=0.50
+mask_feather_ratio=30
+mask_down_size=1.05
 mask_size=1
 show_mouth_mask_box=False
 flip_faces_value=False
@@ -92,3 +93,13 @@ use_ink_filter_white=False
 use_ink_filter_black=False
 use_black_lines=False
 face_forehead_var=0.1
+
+auto_rotate_value = True 
+auto_rotate_switch_main = None
+auto_rotate_switch_preview = None
+rotation_check_interval = 5
+
+detection_frequency = 1 # Default to 3 (Balanced speed/accuracy)
+
+mask_target_option = "Both" # Add this line
+mouth_mask_enabled_faces = [True] * 10 # Initialize 10 faces to True

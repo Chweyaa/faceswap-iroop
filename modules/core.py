@@ -1,26 +1,38 @@
 import os
 import sys
+import time
+import subprocess
+import shutil
+import argparse
+import signal
+import platform
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import List
+
 # single thread doubles cuda performance - needs to be set before torch import
 if any(arg.startswith('--execution-provider') for arg in sys.argv):
     os.environ['OMP_NUM_THREADS'] = '1'
 # reduce tensorflow log level
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import warnings
-from typing import List
-import platform
-import signal
-import shutil
-import argparse
 import torch
 import onnxruntime
 import tensorflow
+import cv2
+import numpy as np
+from tqdm import tqdm
 
 import modules.globals
 import modules.metadata
 import modules.ui as ui
 from modules.processors.frame.core import get_frame_processors_modules
 from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
-from modules.face_analyser import initialize_face_analyser
+from modules.face_analyser import initialize_face_analyser, get_many_faces
+# Import rotation estimator
+from modules.processors.frame.face_swapper import estimate_head_rotation
+
 
 if 'ROCMExecutionProvider' in modules.globals.execution_providers:
     del torch
@@ -187,62 +199,248 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     if not modules.globals.headless:
         ui.update_status(message)
 
+# --- THREAD-SAFE FRAME PROCESSING ---
+# This function handles the rotation locally to avoid race conditions
+def process_frame_stream(processors, source_images, frame, rotation_angle):
+    """
+    Helper for the thread pool to process a single frame without global overhead.
+    """
+    # 1. Apply Thread-Local Rotation
+    if rotation_angle != 0:
+        if rotation_angle == -90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation_angle == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif rotation_angle == 180 or rotation_angle == -180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+    # 2. Apply Global Flips (if needed)
+    if modules.globals.flip_x:
+        frame = cv2.flip(frame, 1)
+    if modules.globals.flip_y:
+        frame = cv2.flip(frame, 0)
+        
+    try:
+        # 3. Run Processors (Global face_rot_range is forced to 0, so they won't rotate)
+        for processor in processors:
+            frame = processor.process_frame(source_images, frame)
+    except Exception:
+        pass
+        
+    # 4. Re-apply Global Flips
+    if modules.globals.flip_x:
+        frame = cv2.flip(frame, 1)
+    if modules.globals.flip_y:
+        frame = cv2.flip(frame, 0)
+
+    # 5. Un-Rotate
+    if rotation_angle != 0:
+        if rotation_angle == -90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif rotation_angle == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation_angle == 180 or rotation_angle == -180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+            
+    return frame
+
 def start() -> None:
+    # 1. Initialize Processors
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_start():
             return
+    
+    # 2. Prepare Source Faces
+    source_images = []
+    if modules.globals.source_path:
+        source_image = cv2.imread(modules.globals.source_path)
+        faces = get_many_faces(source_image)
+        if faces:
+            source_images = sorted(faces, key=lambda face: face.bbox[0])[:20]
+
     update_status('Processing...')
-    # process image to image
+    
+    # --- IMAGE PROCESSING ---
     if has_image_extension(modules.globals.target_path):
         if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
             return
         try:
-            shutil.copy2(modules.globals.target_path, modules.globals.output_path)
-        except Exception as e:
-            print("Error copying file:", str(e))
-        for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
-            update_status('Progressing...', frame_processor.NAME)
-            frame_processor.process_image(modules.globals.source_path, modules.globals.output_path, modules.globals.output_path)
+            target_frame = cv2.imread(modules.globals.target_path)
+            for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
+                target_frame = frame_processor.process_frame(source_images, target_frame)
+            cv2.imwrite(modules.globals.output_path, target_frame)
             release_resources()
-        if is_image(modules.globals.target_path):
+        except Exception as e:
+             print(f"Error processing image: {e}")
+        
+        if is_image(modules.globals.output_path):
             update_status('Processing to image succeed!')
         else:
             update_status('Processing to image failed!')
         return
-    # process image to videos
+
+    # --- VIDEO PROCESSING (FAST STREAMING) ---
     if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
         return
-    update_status('Creating temp resources...')
-    create_temp(modules.globals.target_path)
-    update_status('Extracting frames...')
-    extract_frames(modules.globals.target_path)
-    temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
-    for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
-        update_status('Progressing...', frame_processor.NAME)
-        frame_processor.process_video(modules.globals.source_path, temp_frame_paths)
-        release_resources()
-    # handles fps
-    if modules.globals.keep_fps:
-        update_status('Detecting fps...')
-        fps = detect_fps(modules.globals.target_path)
-        update_status(f'Creating video with {fps} fps...')
-        create_video(modules.globals.target_path, fps)
-    else:
-        update_status('Creating video with 30.0 fps...')
-        create_video(modules.globals.target_path)
-    # handle audio
+
+    # 1. Get Video Info
+    cap = cv2.VideoCapture(modules.globals.target_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # We write to a temp video file first (no audio yet)
+    temp_video_path = modules.globals.output_path + ".temp.mp4"
+    
+    # 2. Setup FFmpeg Pipe
+    cmd = [
+        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+        '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', f'{width}x{height}',
+        '-pix_fmt', 'bgr24',
+        '-r', str(fps),
+        '-i', '-', 
+        '-c:v', modules.globals.video_encoder,
+        '-crf', str(modules.globals.video_quality),
+        '-pix_fmt', 'yuv420p',
+        temp_video_path
+    ]
+    
+    process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    processors = get_frame_processors_modules(modules.globals.frame_processors)
+    
+    # 3. Process Loop with ThreadPool
+    update_status(f'Processing video with {modules.globals.execution_threads} threads...')
+    futures = deque()
+    
+    # Rotation check counter
+    rotation_check_counter = 0
+    
+    # CRITICAL: Store original manual rotation user preference
+    user_manual_rotation = modules.globals.face_rot_range
+    # DISABLE Global Rotation during processing so threads don't get confused
+    modules.globals.face_rot_range = 0
+    
+    try:
+        with tqdm(total=total_frames, unit='frame') as pbar:
+            with ThreadPoolExecutor(max_workers=modules.globals.execution_threads) as executor:
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    # --- DETERMINE ROTATION FOR THIS FRAME ---
+                    current_rotation = 0
+                    
+                    if modules.globals.auto_rotate_value:
+                        # Logic: Use cached value or check every interval
+                        # Ideally, we check occasionally. For simplicity/speed in threading, 
+                        # we can either check every frame (slow) or use the user's manual value if auto is off.
+                        # Since we are single-threaded reading, we can check.
+                        
+                        if rotation_check_counter % modules.globals.rotation_check_interval == 0:
+                            rotation_check_faces = get_many_faces(frame)
+                            found_rotation = False
+                            
+                            # 1. Check Normal
+                            if rotation_check_faces:
+                                main_face = max(rotation_check_faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
+                                angle = estimate_head_rotation(main_face)
+                                if angle > 60: current_rotation = -90 
+                                elif angle < -60: current_rotation = 90
+                                else: current_rotation = 0
+                                found_rotation = True
+                            
+                            # 2. Check 180
+                            if not found_rotation:
+                                frame_180 = cv2.rotate(frame, cv2.ROTATE_180)
+                                faces_180 = get_many_faces(frame_180)
+                                if faces_180:
+                                    current_rotation = 180
+                                else:
+                                    current_rotation = 0
+                            
+                            # Store this detected rotation for the next few frames? 
+                            # For safety in this implementation, we simply use this value for this frame.
+                            # To apply it to next frames, we would need a 'sticky_rotation' variable.
+                            # Let's use a sticky variable for smoother processing.
+                            modules.globals.temp_sticky_rotation = current_rotation
+                        
+                        # Use sticky rotation
+                        if hasattr(modules.globals, 'temp_sticky_rotation'):
+                            current_rotation = modules.globals.temp_sticky_rotation
+                        else:
+                            current_rotation = 0
+                            
+                    else:
+                        # Auto is OFF, use the manual setting
+                        current_rotation = user_manual_rotation
+                    
+                    rotation_check_counter += 1
+                    # -----------------------------------------------
+                    
+                    # Submit task with SPECIFIC ROTATION
+                    future = executor.submit(process_frame_stream, processors, source_images, frame, current_rotation)
+                    futures.append(future)
+                    
+                    # Maintain buffer size
+                    while len(futures) > modules.globals.execution_threads * 2:
+                        result_frame = futures.popleft().result()
+                        if result_frame is not None:
+                            try:
+                                # FIX: Ensure Contiguous Memory
+                                result_frame = np.ascontiguousarray(result_frame)
+                                process.stdin.write(result_frame.tobytes())
+                            except Exception:
+                                pass
+                        pbar.update(1)
+                
+                # Flush remaining frames
+                while futures:
+                    result_frame = futures.popleft().result()
+                    if result_frame is not None:
+                        try:
+                            # FIX: Ensure Contiguous Memory
+                            result_frame = np.ascontiguousarray(result_frame)
+                            process.stdin.write(result_frame.tobytes())
+                        except Exception:
+                            pass
+                    pbar.update(1)
+    finally:
+        # RESTORE Global Rotation preference
+        modules.globals.face_rot_range = user_manual_rotation
+        if hasattr(modules.globals, 'temp_sticky_rotation'):
+            del modules.globals.temp_sticky_rotation
+
+    cap.release()
+    process.stdin.close()
+    process.wait()
+
+    # 5. Restore Audio
     if modules.globals.keep_audio:
-        if modules.globals.keep_fps:
-            update_status('Restoring audio...')
-        else:
-            update_status('Restoring audio might cause issues as fps are not kept...')
-        restore_audio(modules.globals.target_path, modules.globals.output_path)
+        update_status('Restoring audio...')
+        cmd_audio = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', temp_video_path,
+            '-i', modules.globals.target_path,
+            '-c:v', 'copy', '-map', '0:v:0', '-map', '1:a:0',
+            '-shortest', modules.globals.output_path
+        ]
+        subprocess.run(cmd_audio)
+        if os.path.exists(modules.globals.output_path):
+            os.remove(temp_video_path)
     else:
-        move_temp(modules.globals.target_path, modules.globals.output_path)
-    # clean and validate
+        if os.path.exists(modules.globals.output_path):
+            os.remove(modules.globals.output_path)
+        os.rename(temp_video_path, modules.globals.output_path)
+
     clean_temp(modules.globals.target_path)
-    if is_video(modules.globals.target_path):
+    
+    if os.path.exists(modules.globals.output_path):
         update_status('Processing to video succeed!')
+        
+
     else:
         update_status('Processing to video failed!')
 

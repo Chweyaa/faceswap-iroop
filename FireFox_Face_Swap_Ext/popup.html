@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { width: 220px; padding: 15px; font-family: 'Segoe UI', sans-serif; background: #1a1a1a; color: white; }
+        h3 { margin-top: 0; text-align: center; color: #2aa666; }
+        
+        select {
+            width: 100%; padding: 8px; margin-bottom: 10px;
+            background: #333; color: white; border: 1px solid #555;
+            border-radius: 4px;
+        }
+        
+        button { 
+            width: 100%; padding: 10px; 
+            background: #2aa666; color: white; 
+            border: none; border-radius: 4px;
+            cursor: pointer; font-weight: bold;
+        }
+        button:hover { background: #3cb666; }
+        
+        #status { margin-top: 10px; font-size: 12px; color: #aaa; text-align: center; }
+        .info { font-size: 10px; color: #666; text-align: center; margin-bottom: 10px;}
+    </style>
+</head>
+<body>
+    <h3>iRoop Swapper</h3>
+    
+    <div class="info">Select Source Face in App first.<br>Enable Enhancer in App if desired.</div>
+
+    <label for="faceIndex" style="font-size: 12px;">Target Face:</label>
+    <select id="faceIndex">
+        <option value="-1" selected>Many Faces (All)</option>
+        <option value="0">Face 1</option>
+        <option value="1">Face 2</option>
+        <option value="2">Face 3</option>
+        <option value="3">Face 4</option>
+        <option value="4">Face 5</option>
+        <option value="5">Face 6</option>
+        <option value="6">Face 7</option>
+        <option value="7">Face 8</option>
+        <option value="8">Face 9</option>
+        <option value="9">Face 10</option>
+    </select>
+
+    <button id="swapBtn">Swap Page</button>
+    <div id="status">Ready</div>
+    
+    <script src="popup.js"></script>
+</body>
+</html>
